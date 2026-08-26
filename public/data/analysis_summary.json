@@ -1,0 +1,21 @@
+{
+  "channel_map": {
+    "EXG Channel 0": "O1 (provisional)",
+    "EXG Channel 1": "O2 (provisional)",
+    "EXG Channel 2": "horizontal EOG (polarity uncalibrated)",
+    "EXG Channel 3": "vertical EOG + blinks (polarity uncalibrated)"
+  },
+  "channel_map_status": "Functionally reconstructed; horizontal/vertical polarity is uncalibrated.",
+  "recordings": 12,
+  "conditions": 6,
+  "movement_windows": 134,
+  "blink_candidates": 1533,
+  "horizontal_saccade_candidates": 1572,
+  "vertical_saccade_candidates": 738,
+  "detector_status": "Adaptive candidate detector; no calibration or video ground truth was available.",
+  "event_thresholds": {
+    "blink_vertical_robust_z": 5.0,
+    "saccade_velocity_robust_z": 6.0,
+    "blink_exclusion_radius_seconds": 0.4
+  }
+}
