@@ -74,3 +74,73 @@ The rail-focused comparison confirms the measured/relation/question hierarchy, p
 ## Final result
 
 final result: passed
+
+---
+
+# NoiseColor Design QA
+
+## Comparison target
+
+- Source visual truth: `docs/design/reference-selected.png`
+- Browser-rendered desktop implementation: `docs/design/noisecolor-desktop.png`
+- Browser-rendered portrait implementation: `docs/design/noisecolor-mobile.png`
+- Combined comparison evidence: `docs/design/noisecolor-design-comparison.png`
+
+## Comparison setup
+
+- State: NoiseColor default Live Analysis view, microphone stopped, Balanced mode selected, install control available.
+- Source pixels: 1487 × 1058.
+- Desktop implementation pixels and CSS viewport: 1440 × 1000 at device scale factor 1.
+- Portrait CSS viewport: 390 × 844 at device scale factor 1; full-page implementation capture: 390 × 1303.
+- Responsive bound check: at a 360 × 800 viewport, `innerWidth` was 360 px and document scroll width was 345 px, with no document-level horizontal overflow.
+- Density normalization: the combined evidence scales both desktop images to 900 px high with high-quality bicubic interpolation. The source occupies the left half and the NoiseColor implementation occupies the right half.
+
+## Full-view and focused evidence
+
+The combined full-view comparison verifies the selected direction's dark full-screen field, narrow left tool rail, lime scientific accent, dense central measurement area, and measured/interpretation/question rail. NoiseColor intentionally replaces the recording-specific four-trajectory field and playback footer with a live stable-classification field, current metrics, β history, and microphone controls because it is a separate product with a different primary task.
+
+The portrait capture is the focused evidence because phone use is the primary NoiseColor target. It verifies the complete first-use hierarchy, all five primary actions, large touch targets, text-plus-β-plus-quality communication, privacy statement, and a legible β-history card without horizontal overflow. A separate crop was unnecessary because the primary controls and small scientific labels remain readable at original capture density.
+
+## Findings
+
+- No actionable P0, P1, or P2 visual differences remain.
+- Fonts and typography: system Inter/SF/Segoe fallbacks preserve the source's compact scientific hierarchy while remaining native and legible on iPhone and Android. Large classification text, β, confidence, metric labels, and monospace scientific metadata retain distinct optical roles.
+- Spacing and layout rhythm: desktop preserves the source's rail/field/interpretation proportions. Portrait collapses to one clear column, keeps the install control and five actions visible, and uses 44–52 px touch targets. No persistent control is hidden by viewport overflow.
+- Colors and visual tokens: near-black navy surfaces, hairline blue-gray borders, and lime measurement accents match the source. Canonical color states use violet, cyan, white, pink, and orange, always paired with text and β rather than hue alone.
+- Image quality and asset fidelity: the project-bound bitmap app icon and README install badges are sharp at their target sizes and share the selected field's waveform/grid art direction. No placeholder imagery, emoji, CSS-drawn logo, or copied NoiseCapture asset is used.
+- Copy and content: the first screen answers the live spectral-color question directly, states local-only audio handling, distinguishes the stable result from Instant β, and retains measured/interpretation/question framing in the desktop rail and scientific details.
+- Accessibility: semantic navigation, headings, status regions, labels, dialogs, tabs, visible focus, reduced-motion handling, safe-area variables, large controls, and text/β/quality redundancy are present.
+
+## Interaction verification
+
+- Exact local route `/noisecolor/` opened NoiseColor rather than the parent React application.
+- iOS and Android install query links opened their platform-specific instruction sheets; normal app opening did not auto-open installation guidance.
+- A synthetic 4-second WAV uploaded through the browser, retained its declared 16 kHz rate, and produced the scientifically correct `Tonal / non-noise` gate instead of a color label.
+- The uploaded result populated diagnostics and a visible time-frequency spectrogram, saved to local IndexedDB history, and exposed JSON/CSV/advanced actions.
+- The versioned service worker registered at scope `/noisecolor/`; the earlier update exercise displayed and activated the waiting v0.4.4 worker, and the final v0.5.3 pass confirmed versioned module URLs plus a coherent offline launch.
+- The original Pink Noise Relational Field root route rendered its unchanged heading and produced no browser console warnings or errors.
+- Console checks for NoiseColor mobile, desktop, upload, history, spectrogram, install, update, and offline states produced no warnings or errors.
+- Live microphone permission could not be completed in the available in-app browser; the Start Live Analysis control was exercised, but real iPhone Safari and Android Chromium microphone/permission/interruption behavior remains a clearly documented manual device check.
+
+## Comparison history
+
+1. The first portrait pass found duplicate pre-measurement guidance and a scrolling action row that hid History and Advanced beyond the initial viewport. The copy was separated into a concise `No stable estimate yet` line plus one explanatory sentence, and the phone labels were compacted so all five actions remain visible.
+2. Upload verification found browser resampling obscured a low-rate WAV's declared source rate and recorded/uploaded results did not yet populate the spectrogram. WAV sample-rate preservation and worker-generated recording spectrograms were added; the same 16 kHz tonal file then rendered correctly in both diagnostics and the spectrogram.
+3. The service-worker update test found the old v0.4.0 shell remained active until an update was offered. The visible update banner successfully activated the waiting worker and reloaded a coherent v0.4.4 shell. The v0.5.3 follow-up added matching version query parameters to the shell and every imported module, then verified the new version offline. Final mobile and desktop review found no remaining P0/P1/P2 issue.
+
+## Follow-up polish
+
+- [P3] The desktop idle β field is intentionally quieter than the source's measured temporal ribbons. Once listening begins, live β history, PSD, and spectrogram data provide the corresponding visual density without fabricating an idle trace.
+- [P3] Native iOS Safari and Android Chromium install banners, safe-area insets, Bluetooth route changes, calls, screen lock, and microphone constraint reporting should receive a final physical-device pass before public launch.
+
+## Implementation checklist
+
+- [x] Preserve the selected scientific visual language without changing the parent React app.
+- [x] Make Live Analysis the phone-first primary task.
+- [x] Keep color, β, quality, privacy, and installation messaging legible in portrait.
+- [x] Verify upload, local history, advanced views, spectrogram, update flow, offline shell, scoped service worker, and root-app regression.
+- [x] Save equal-view comparison evidence and final responsive captures.
+
+## Final result
+
+final result: passed

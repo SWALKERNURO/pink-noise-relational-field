@@ -18,5 +18,17 @@ export default defineConfig({
       clientFiles: ["./src/main.jsx"],
     },
   },
-  plugins: [react()],
+  plugins: [
+    react(),
+    {
+      name: "noisecolor-directory-index",
+      configureServer(server) {
+        server.middlewares.use((request, _response, next) => {
+          const [pathname, query = ""] = (request.url || "").split("?");
+          if (pathname === "/noisecolor/") request.url = `/noisecolor/index.html${query ? `?${query}` : ""}`;
+          next();
+        });
+      },
+    },
+  ],
 });

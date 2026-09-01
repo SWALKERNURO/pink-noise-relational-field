@@ -13,3 +13,10 @@ When implementing from a selected generated mock, treat that image as the source
 - The default state focuses on the 31:31 video recording and uses the validated EEG/EOG pilot analysis in `public/data/`.
 
 Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts/prepare-sites-build.mjs`, and `tests/sites-worker.test.mjs` intact so the same local prototype can be handed to Sites. Before a Sites handoff, run `npm run build` and `npm run test:sites`; the build must leave `dist/client/index.html`, `dist/server/index.js`, and `dist/.openai/hosting.json`.
+
+## NoiseColor product boundary
+
+- NoiseColor is the only product modified by NoiseColor feature work. Do not redesign or materially change the Pink Noise Relational Field React application.
+- Primary NoiseColor application code belongs under `public/noisecolor/`; repository-level files may change only when needed to build, test, document, install, or deploy NoiseColor.
+- Preserve both the repository root experience and the existing `/noisecolor/` GitHub Pages URL.
+- Live microphone spectral-color estimation is NoiseColor's primary workflow. Audio stays local, raw live audio is not persisted by default, and scientific quality gates must prevent confident labels for silence, tonal input, unstable input, clipping, or poor single-power-law fits.

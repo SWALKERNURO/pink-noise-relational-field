@@ -57,11 +57,14 @@ test("condition comparison fields come from the condition summary table", () => 
 });
 
 test("NoiseColor exposes local audio upload and decoded-file provenance", async () => {
-  const html = await readFile(new URL("../public/noisecolor/index.html", import.meta.url), "utf8");
+  const [html, app] = await Promise.all([
+    readFile(new URL("../public/noisecolor/index.html", import.meta.url), "utf8"),
+    readFile(new URL("../public/noisecolor/app.js", import.meta.url), "utf8"),
+  ]);
 
   assert.match(html, /id="audioFile"[^>]+accept="audio\/\*/);
-  assert.match(html, /function loadAudioFile\(file\)/);
-  assert.match(html, /decodeAudioData/);
-  assert.match(html, /sourceType: state\.sourceType/);
-  assert.match(html, /addEventListener\('drop'/);
+  assert.match(app, /async function loadAudioFile\(file\)/);
+  assert.match(app, /decodeAudioData/);
+  assert.match(app, /currentOptions\("uploaded-file", file\.name, bounded\)/);
+  assert.match(app, /addEventListener\("drop"/);
 });
