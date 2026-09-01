@@ -117,7 +117,7 @@ The portrait capture is the focused evidence because phone use is the primary No
 - iOS and Android install query links opened their platform-specific instruction sheets; normal app opening did not auto-open installation guidance.
 - A synthetic 4-second WAV uploaded through the browser, retained its declared 16 kHz rate, and produced the scientifically correct `Tonal / non-noise` gate instead of a color label.
 - The uploaded result populated diagnostics and a visible time-frequency spectrogram, saved to local IndexedDB history, and exposed JSON/CSV/advanced actions.
-- The versioned service worker registered at scope `/noisecolor/`; the earlier update exercise displayed and activated the waiting v0.4.4 worker, and the final v0.5.3 pass confirmed versioned module URLs plus a coherent offline launch.
+- The versioned service worker registered at scope `/noisecolor/`; the earlier update exercise displayed and activated the waiting v0.4.4 worker, and the final v0.6.1 remediation pass confirmed versioned module URLs plus a coherent offline launch.
 - The original Pink Noise Relational Field root route rendered its unchanged heading and produced no browser console warnings or errors.
 - Console checks for NoiseColor mobile, desktop, upload, history, spectrogram, install, update, and offline states produced no warnings or errors.
 - Live microphone permission could not be completed in the available in-app browser; the Start Live Analysis control was exercised, but real iPhone Safari and Android Chromium microphone/permission/interruption behavior remains a clearly documented manual device check.
@@ -126,7 +126,19 @@ The portrait capture is the focused evidence because phone use is the primary No
 
 1. The first portrait pass found duplicate pre-measurement guidance and a scrolling action row that hid History and Advanced beyond the initial viewport. The copy was separated into a concise `No stable estimate yet` line plus one explanatory sentence, and the phone labels were compacted so all five actions remain visible.
 2. Upload verification found browser resampling obscured a low-rate WAV's declared source rate and recorded/uploaded results did not yet populate the spectrogram. WAV sample-rate preservation and worker-generated recording spectrograms were added; the same 16 kHz tonal file then rendered correctly in both diagnostics and the spectrogram.
-3. The service-worker update test found the old v0.4.0 shell remained active until an update was offered. The visible update banner successfully activated the waiting worker and reloaded a coherent v0.4.4 shell. The v0.5.3 follow-up added matching version query parameters to the shell and every imported module, then verified the new version offline. Final mobile and desktop review found no remaining P0/P1/P2 issue.
+3. The service-worker update test found the old v0.4.0 shell remained active until an update was offered. The visible update banner successfully activated the waiting worker and reloaded a coherent v0.4.4 shell. The v0.6.1 follow-up retained matching version query parameters across the shell and every imported module, activated the waiting update, and verified the new version offline.
+
+## v0.6.1 remediation verification
+
+- A valid 16 kHz PCM WAV was decoded directly from its bounded analysis tail and received the expected tonal/non-noise gate.
+- Replacing that file with an invalid WAV removed the prior classification, exports, save control, diagnostics, PSD, and spectrogram before showing the decode failure.
+- Clear returned classification, stable β, upload/recording status, result containers, diagnostics, and chart alternatives to their initial state.
+- Saved-result actions disabled after one save; compact history entries disclose that detailed PSD arrays are intentionally not retained.
+- Arrow-key navigation moved between the scientific tabs with matching selected tab and tabpanel semantics.
+- At 390 × 844, all five modes plus Clear and Install remained visible with no horizontal overflow; at 320 px, document and topbar widths remained bounded to 320 px.
+- Desktop NoiseColor retained both rails without overflow, and the parent Pink Noise Relational Field retained its heading and playback controls.
+- The waiting v0.6.1 service worker activated through the visible update control; after the preview server stopped, `/noisecolor/` reloaded as v0.6.1 from the offline shell.
+- Reload checks produced no browser page errors or console output.
 
 ## Follow-up polish
 

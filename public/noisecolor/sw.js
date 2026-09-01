@@ -1,17 +1,17 @@
-const VERSION = "0.5.3";
+const VERSION = "0.6.1";
 const CACHE_NAME = `noisecolor-shell-${VERSION}`;
 const SHELL = [
   "./",
   "./index.html",
-  "./styles.css?v=0.5.3",
-  "./app.js?v=0.5.3",
-  "./analysis-engine.js?v=0.5.3",
-  "./analysis-worker.js?v=0.5.3",
-  "./audio-worklet.js?v=0.5.3",
-  "./live-state.js?v=0.5.3",
-  "./live-runtime.js?v=0.5.3",
-  "./history.js?v=0.5.3",
-  "./pwa.js?v=0.5.3",
+  "./styles.css?v=0.6.1",
+  "./app.js?v=0.6.1",
+  "./analysis-engine.js?v=0.6.1",
+  "./analysis-worker.js?v=0.6.1",
+  "./audio-worklet.js?v=0.6.1",
+  "./live-state.js?v=0.6.1",
+  "./live-runtime.js?v=0.6.1",
+  "./history.js?v=0.6.1",
+  "./pwa.js?v=0.6.1",
   "./manifest.webmanifest",
   "./icons/icon-192.png",
   "./icons/icon-512.png",

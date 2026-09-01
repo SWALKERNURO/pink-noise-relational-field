@@ -42,8 +42,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, a:focus-visible
 .brand small { margin-top: 3px; color: var(--muted); font-size: 9px; white-space: nowrap; }
 .top-actions { display: flex; align-items: center; gap: 8px; }
 .privacy-chip { display: none; color: var(--accent); font: 600 9px/1.1 ui-monospace, "SFMono-Regular", monospace; letter-spacing: .08em; text-transform: uppercase; }
-.install-button, .primary-button, .secondary-button, .danger-button, .summary-actions button, .card-heading button { min-height: 44px; border-radius: 7px; border: 1px solid var(--line); padding: 0 14px; font-weight: 700; font-size: 12px; cursor: pointer; }
+.install-button, .clear-button, .primary-button, .secondary-button, .danger-button, .summary-actions button, .card-heading button { min-height: 44px; border-radius: 7px; border: 1px solid var(--line); padding: 0 14px; font-weight: 700; font-size: 12px; cursor: pointer; }
 .install-button { background: transparent; border-color: #536a31; color: var(--accent); }
+.clear-button { background: transparent; color: var(--muted); }
 .primary-button { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .secondary-button, .summary-actions button, .card-heading button { background: var(--surface-3); color: var(--text); }
 .danger-button { background: transparent; color: #fda4af; border-color: #5f2935; }
@@ -110,9 +111,10 @@ canvas { display: block; width: 100%; height: auto; margin-top: 14px; background
 .action-panel > div span { font: 500 34px/1 ui-monospace, "SFMono-Regular", monospace; }
 .action-panel > div small { color: var(--muted); }
 .inline-status { margin-top: 12px; min-height: 45px; padding: 12px 14px; border-left: 2px solid var(--accent); background: var(--surface); color: var(--muted); font-size: 12px; line-height: 1.5; }
-.file-drop { margin-top: 22px; min-height: 155px; padding: 28px 20px; border: 1px dashed #486030; background: var(--surface); cursor: pointer; display: grid; place-items: center; align-content: center; gap: 8px; text-align: center; }
+.file-drop { margin-top: 22px; min-height: 155px; padding: 28px 20px; border: 1px dashed #486030; background: var(--surface); cursor: pointer; display: grid; place-items: center; align-content: center; gap: 8px; text-align: center; position: relative; }
 .file-drop.dragging { border-color: var(--accent); background: var(--surface-2); }
-.file-drop input { position: absolute; inline-size: 1px; block-size: 1px; opacity: 0; pointer-events: none; }
+.file-drop:focus-within { outline: 2px solid var(--accent); outline-offset: 3px; }
+.file-drop input { position: absolute; inset: 0; inline-size: 100%; block-size: 100%; opacity: 0; cursor: pointer; }
 .file-drop strong { font-size: 15px; }
 .file-drop span { color: var(--muted); font-size: 10px; line-height: 1.45; }
 .file-drop.compact { min-height: 105px; margin: 0; }
@@ -142,6 +144,7 @@ canvas { display: block; width: 100%; height: auto; margin-top: 14px; background
 .advanced-tab.active, .spectrum-toggle button.active { color: var(--text); border-bottom-color: var(--accent); }
 .advanced-panel { margin-top: 0; border-top: 0; }
 .chart-note { margin: 12px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.chart-data-summary { margin: 10px 0 0; color: var(--muted); font-size: 10px; line-height: 1.5; }
 .diagnostic-grid { display: grid; grid-template-columns: repeat(2, 1fr); border: 1px solid var(--line-soft); }
 .diagnostic-grid > div { min-width: 0; padding: 13px; display: grid; gap: 7px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
 .diagnostic-grid strong { overflow-wrap: anywhere; }
@@ -175,6 +178,13 @@ canvas { display: block; width: 100%; height: auto; margin-top: 14px; background
 .app-shell[data-state="tonal"], .app-shell[data-state="mixed"], .app-shell[data-state="unstable"] { --state-color: var(--warn); }
 .app-shell[data-state="silence"], .app-shell[data-state="paused"], .app-shell[data-state="listening"], .app-shell[data-state="insufficient"] { --state-color: var(--muted); }
 .app-shell[data-state="clipping"], .app-shell[data-state="unavailable"], .app-shell[data-state="invalid"] { --state-color: var(--danger); }
+
+@media (max-width: 420px) {
+  .topbar { padding-inline: 9px; gap: 7px; }
+  .top-actions { gap: 5px; }
+  .clear-button, .install-button { padding-inline: 9px; font-size: 10px; }
+  .brand small { display: none; }
+}
 
 @media (min-width: 640px) {
   .mode-button { flex: 0 0 auto; padding-inline: 17px; font-size: 12px; }

@@ -7,16 +7,19 @@ import {
   WELCH_OVERLAP,
   summarize,
   summarizeSession,
-} from "./analysis-engine.js?v=0.5.3";
-import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.5.3";
-import { clearMeasurements, deleteMeasurement, listMeasurements, saveMeasurement } from "./history.js?v=0.5.3";
-import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.5.3";
-import { MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow } from "./live-runtime.js?v=0.5.3";
+} from "./analysis-engine.js?v=0.6.1";
+import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.1";
+import { clearMeasurements, deleteMeasurement, listMeasurements, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.1";
+import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.1";
+import { MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow } from "./live-runtime.js?v=0.6.1";
 
-const MAX_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_FILE_BYTES = 40 * 1024 * 1024;
+const MAX_RECORDING_BYTES = 32 * 1024 * 1024;
+const MAX_RECORDING_SECONDS = 120;
+const AUDIO_CONTEXT_START_TIMEOUT_MS = 6000;
 
 const elements = Object.fromEntries([
-  "appShell", "installButton", "updateBanner", "reloadButton", "liveView", "analysisMode", "classification",
+  "appShell", "installButton", "clearButton", "updateBanner", "reloadButton", "liveView", "analysisMode", "classification",
   "liveStateLabel", "stableBeta", "confidence", "qualityDetail", "startLiveButton", "stopLiveButton", "currentColor",
   "instantBeta", "stability", "fitResidual", "signalLevel", "windowValue", "betaCanvas", "liveSummary", "summaryMetrics",
   "saveSummaryButton", "exportSummaryButton", "exportSummaryCsvButton", "recordTimer", "recordFormat", "recordButton", "stopRecordButton",
@@ -24,7 +27,7 @@ const elements = Object.fromEntries([
   "uploadResult", "clearHistoryButton", "historyList", "spectrumCanvas", "spectrumNote", "spectrogramCanvas",
   "diagnosticGrid", "measuredCopy", "interpretationCopy", "calibrationFile", "calibrationProfile", "calibrationState",
   "scalarGain", "railMeasured", "railInterpretation", "railStatus", "versionLabel", "installSheet", "closeInstallSheet",
-  "installInstructions", "privacyChip", "summaryTimeline",
+  "installInstructions", "privacyChip", "summaryTimeline", "betaDataSummary", "spectrumDataSummary", "spectrogramDataSummary",
 ].map((id) => [id, document.getElementById(id)]));
 
 const stateMachine = new ColorStateMachine();
@@ -32,6 +35,7 @@ const state = {
   worker: null,
   workerRequests: new Map(),
   workerId: 0,
+  workerBusy: false,
   stream: null,
   audioContext: null,
   sourceNode: null,
@@ -42,6 +46,7 @@ const state = {
   recording: false,
   sampleRate: null,
   inputRoute: null,
+  inputRouteLabel: null,
   constraintSettings: null,
   startedAt: null,
   fastTimer: null,
@@ -50,6 +55,7 @@ const state = {
   recordTimer: null,
   fastBusy: false,
   stableBusy: false,
+  spectrogramBusy: false,
   wakeLock: null,
   observations: [],
   betaHistory: [],
@@ -58,15 +64,19 @@ const state = {
   lastSummary: null,
   recorder: null,
   recordingChunks: [],
+  recordingBytes: 0,
   recordingBlob: null,
   recordingUrl: null,
   calibrationProfiles: [],
   activeCalibration: null,
   activeSpectrum: "psd",
   installPromptReady: false,
+  currentView: "live",
   stopping: false,
   finalizingRecording: false,
   captureGeneration: 0,
+  analysisGeneration: 0,
+  recordingAnalysisGeneration: 0,
 };
 
 function modeConfig() {
@@ -101,39 +111,60 @@ function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) 
     temporalSd: sourceType === "live" ? summarize(state.observations.slice(-10).filter((item) => item.reliable).map((item) => item.beta)).sd || 0 : 0,
     maxWelchSegments: sourceType === "live" ? 48 : 96,
     scalarGainDb: Number(elements.scalarGain.value) || 0,
-    inputRouteId: state.inputRoute,
-    microphoneSettings: sourceType === "live" || sourceType === "recorded-microphone" ? state.constraintSettings : null,
+    calibrationRouteKey: state.inputRoute,
+    inputRouteLabel: state.inputRouteLabel,
+    microphoneSettings: sourceType === "live" || sourceType === "recorded-microphone" ? sanitizeMicrophoneSettings(state.constraintSettings) : null,
     ...extra,
   };
 }
 
 function ensureWorker() {
   if (state.worker) return state.worker;
-  state.worker = new Worker(new URL("./analysis-worker.js?v=0.5.3", import.meta.url), { type: "module" });
+  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.1", import.meta.url), { type: "module" });
   state.worker.addEventListener("message", (event) => {
     const request = state.workerRequests.get(event.data.id);
     if (!request) return;
     state.workerRequests.delete(event.data.id);
+    state.workerBusy = false;
     if (event.data.error) request.reject(new Error(event.data.error));
     else request.resolve(event.data.result);
   });
   state.worker.addEventListener("error", (error) => {
     for (const request of state.workerRequests.values()) request.reject(error);
     state.workerRequests.clear();
+    state.workerBusy = false;
   });
   return state.worker;
 }
 
 function requestAnalysis(type, samples, sampleRate, options = {}) {
+  if (state.workerBusy) return Promise.reject(new Error("Analysis is busy; the superseded request was dropped."));
   const worker = ensureWorker();
   const id = ++state.workerId;
+  state.workerBusy = true;
   return new Promise((resolve, reject) => {
     state.workerRequests.set(id, { resolve, reject });
-    worker.postMessage({ id, type, samples, sampleRate, options }, [samples.buffer]);
+    try {
+      worker.postMessage({ id, type, samples, sampleRate, options }, [samples.buffer]);
+    } catch (error) {
+      state.workerRequests.delete(id);
+      state.workerBusy = false;
+      reject(error);
+    }
   });
 }
 
+function cancelPendingAnalysis() {
+  if (!state.worker) return;
+  for (const request of state.workerRequests.values()) request.reject(new Error("Analysis superseded by a newer action."));
+  state.workerRequests.clear();
+  state.worker.terminate();
+  state.worker = null;
+  state.workerBusy = false;
+}
+
 function setView(view) {
+  state.currentView = view;
   document.querySelectorAll("[data-view-panel]").forEach((panel) => {
     const active = panel.dataset.viewPanel === view;
     panel.hidden = !active;
@@ -152,7 +183,7 @@ function displayLiveState(display, measurement = null) {
   elements.appShell.dataset.state = display.state;
   elements.liveStateLabel.textContent = display.state.replaceAll("-", " ").toUpperCase();
   elements.classification.textContent = display.label;
-  elements.stableBeta.textContent = display.reliable && Number.isFinite(display.displayBeta) ? `β ${display.displayBeta.toFixed(2)}` : "β —";
+  elements.stableBeta.textContent = display.reliable && Number.isFinite(display.displayBeta) ? `Stable β ${display.displayBeta.toFixed(2)}` : "Stable β —";
   elements.confidence.textContent = display.reliable
     ? `${display.confidence} confidence`
     : display.state === "listening" ? "No stable estimate yet" : "No reliable color reported";
@@ -177,6 +208,74 @@ function clearStaleMeasurement(label = "Analysis paused", stateName = "paused", 
   drawEmpty(elements.spectrogramCanvas, "No spectrogram available");
 }
 
+function clearResultContainer(container) {
+  container.hidden = true;
+  container.replaceChildren();
+}
+
+function releaseRecordingObject() {
+  if (state.recordingUrl) URL.revokeObjectURL(state.recordingUrl);
+  state.recordingUrl = null;
+  state.recordingBlob = null;
+  state.recordingChunks = [];
+  state.recordingBytes = 0;
+  elements.downloadAudioButton.hidden = true;
+}
+
+function clearAnalysisResults({ resetStatuses = true } = {}) {
+  state.analysisGeneration += 1;
+  cancelPendingAnalysis();
+  state.latestResult = null;
+  state.latestSpectrogram = null;
+  state.lastSummary = null;
+  state.observations = [];
+  state.betaHistory = [];
+  clearResultContainer(elements.recordResult);
+  clearResultContainer(elements.uploadResult);
+  elements.liveSummary.hidden = true;
+  elements.summaryMetrics.replaceChildren();
+  elements.summaryTimeline.replaceChildren();
+  elements.diagnosticGrid.innerHTML = '<div><span>Status</span><strong>No measurement</strong></div>';
+  elements.measuredCopy.textContent = "No measurement yet.";
+  elements.interpretationCopy.textContent = "Noise color is only reported when input and model-quality gates pass.";
+  elements.spectrumNote.textContent = "Start Live Analysis or analyze a recording to populate the spectrum.";
+  elements.betaDataSummary.textContent = "No β history is available.";
+  elements.spectrumDataSummary.textContent = "No spectrum data is available.";
+  elements.spectrogramDataSummary.textContent = "No spectrogram data is available.";
+  elements.saveSummaryButton.textContent = "Save to History";
+  elements.saveSummaryButton.disabled = false;
+  drawEmpty(elements.betaCanvas, "Start Live Analysis to see β history");
+  drawEmpty(elements.spectrumCanvas, "No spectrum available");
+  drawEmpty(elements.spectrogramCanvas, "No spectrogram available");
+  clearStaleMeasurement("Ready", "listening", "Start Live Analysis or choose a local audio file.");
+  if (resetStatuses) {
+    elements.fileName.textContent = "WAV, MP3, M4A, AAC, OGG, or FLAC · maximum 40 MB";
+    elements.uploadStatus.textContent = "Ready for a local audio file.";
+    elements.recordStatus.textContent = "No audio is being recorded.";
+    elements.recordTimer.textContent = "00:00";
+    elements.recordFormat.textContent = "Format selected after browser detection";
+  }
+}
+
+async function resetApplication() {
+  if (state.recording) {
+    state.recording = false;
+    const recorder = state.recorder;
+    state.recorder = null;
+    window.clearInterval(state.recordTimer);
+    try { if (recorder?.state !== "inactive") recorder.stop(); } catch { /* recorder already stopped */ }
+  }
+  await stopMicrophone({ preserveSummary: true, silent: true });
+  releaseRecordingObject();
+  state.inputRoute = null;
+  state.inputRouteLabel = null;
+  state.constraintSettings = null;
+  elements.audioFile.value = "";
+  clearAnalysisResults();
+  selectCalibration();
+  setView("live");
+}
+
 function inputRouteFromTrack(track) {
   const settings = track.getSettings?.() || {};
   return settings.deviceId || track.label || "default-microphone";
@@ -197,6 +296,34 @@ async function releaseWakeLock() {
   state.wakeLock = null;
 }
 
+async function closeAudioContext(audioContext) {
+  if (!audioContext || audioContext.state === "closed") return;
+  try { await Promise.race([audioContext.close(), new Promise((resolve) => window.setTimeout(resolve, 1500))]); } catch { /* best-effort release */ }
+}
+
+async function resumeAudioContext(audioContext, timeoutMs = AUDIO_CONTEXT_START_TIMEOUT_MS) {
+  let timeoutId;
+  try {
+    await Promise.race([
+      (async () => {
+        await audioContext.resume();
+        if (audioContext.state === "running") return;
+        await new Promise((resolve, reject) => {
+          const onStateChange = () => {
+            if (audioContext.state === "running") { audioContext.removeEventListener("statechange", onStateChange); resolve(); }
+            else if (audioContext.state === "closed") { audioContext.removeEventListener("statechange", onStateChange); reject(new Error("Audio processing closed before startup.")); }
+          };
+          audioContext.addEventListener("statechange", onStateChange);
+        });
+      })(),
+      new Promise((_, reject) => { timeoutId = window.setTimeout(() => reject(new Error("Audio startup timed out. Tap Start Live Analysis to try again.")), timeoutMs); }),
+    ]);
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+  if (audioContext.state !== "running") throw new Error(`Audio processing did not start (state: ${audioContext.state}).`);
+}
+
 async function startMicrophone({ recording = false } = {}) {
   if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access is not supported in this browser.");
   if (state.recording && !recording) throw new Error("Stop the current recording before starting Live Analysis.");
@@ -212,7 +339,15 @@ async function startMicrophone({ recording = false } = {}) {
   const AudioContextClass = window.AudioContext || window.webkitAudioContext;
   const audioContext = new AudioContextClass({ latencyHint: "interactive" });
   state.audioContext = audioContext;
-  await audioContext.resume();
+  try {
+    await resumeAudioContext(audioContext);
+  } catch (error) {
+    stream.getTracks().forEach((item) => item.stop());
+    await closeAudioContext(audioContext);
+    state.stream = null;
+    state.audioContext = null;
+    throw error;
+  }
   const sourceNode = audioContext.createMediaStreamSource(stream);
   const silentGain = audioContext.createGain();
   silentGain.gain.value = 0;
@@ -220,7 +355,7 @@ async function startMicrophone({ recording = false } = {}) {
 
   let captureNode;
   if (audioContext.audioWorklet) {
-    await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.5.3");
+    await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.1");
     captureNode = new AudioWorkletNode(audioContext, "noisecolor-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
     captureNode.port.onmessage = (event) => state.rolling?.push(event.data);
   } else {
@@ -238,7 +373,9 @@ async function startMicrophone({ recording = false } = {}) {
   state.listening = true;
   state.startedAt = performance.now();
   state.inputRoute = inputRouteFromTrack(track);
+  state.inputRouteLabel = "Microphone · current session";
   state.constraintSettings = track.getSettings?.() || {};
+  selectCalibration();
   state.observations = [];
   state.betaHistory = [];
   state.latestResult = null;
@@ -282,7 +419,7 @@ function startSchedulers() {
   stopSchedulers();
   state.fastTimer = window.setInterval(runFastAnalysis, config.fastEveryMs);
   state.stableTimer = window.setInterval(runStableAnalysis, config.stableEveryMs);
-  state.spectrogramTimer = window.setInterval(runSpectrogram, 3500);
+  state.spectrogramTimer = window.setInterval(runSpectrogram, 7000);
 }
 
 function stopSchedulers() {
@@ -292,10 +429,11 @@ function stopSchedulers() {
   }
   state.fastBusy = false;
   state.stableBusy = false;
+  state.spectrogramBusy = false;
 }
 
 async function runFastAnalysis() {
-  if (!state.listening || state.fastBusy || !state.rolling) return;
+  if (!state.listening || state.fastBusy || state.workerBusy || !state.rolling) return;
   const config = modeConfig();
   if (state.rolling.length < state.sampleRate * Math.min(1.5, config.fastSeconds)) return;
   state.fastBusy = true;
@@ -315,7 +453,7 @@ async function runFastAnalysis() {
 }
 
 async function runStableAnalysis() {
-  if (!state.listening || state.stableBusy || !state.rolling) return;
+  if (!state.listening || state.stableBusy || state.workerBusy || !state.rolling) return;
   const config = modeConfig();
   if (state.rolling.length < state.sampleRate * config.stableSeconds) return;
   state.stableBusy = true;
@@ -325,7 +463,8 @@ async function runStableAnalysis() {
     const result = await requestAnalysis("analyze-live", samples, state.sampleRate, currentOptions("live"));
     if (!state.listening || generation !== state.captureGeneration) return;
     const timeSeconds = (performance.now() - state.startedAt) / 1000;
-    const observation = { timeSeconds, beta: result.beta, state: result.state, classification: result.classification, reliable: result.reliable, rmseDb: result.rmseDb, r2: result.r2, spectralFlatness: result.spectralFlatness };
+    const stableSeconds = config.stableSeconds;
+    const observation = { timeSeconds: Math.max(0, timeSeconds - stableSeconds / 2), startSeconds: Math.max(0, timeSeconds - stableSeconds), endSeconds: timeSeconds, beta: result.beta, state: result.state, classification: result.classification, reliable: result.reliable, rmseDb: result.rmseDb, r2: result.r2, spectralFlatness: result.spectralFlatness };
     state.observations.push(observation);
     if (state.observations.length > 3600) state.observations.splice(0, state.observations.length - 3600);
     state.betaHistory.push(observation);
@@ -349,7 +488,9 @@ async function runStableAnalysis() {
 }
 
 async function runSpectrogram() {
-  if (!state.listening || !state.rolling || state.rolling.length < state.sampleRate * 2) return;
+  const spectrogramVisible = state.currentView === "advanced" && document.querySelector('[data-advanced="spectrogram"]')?.classList.contains("active");
+  if (!spectrogramVisible || !state.listening || state.spectrogramBusy || state.workerBusy || !state.rolling || state.rolling.length < state.sampleRate * 2) return;
+  state.spectrogramBusy = true;
   try {
     const generation = state.captureGeneration;
     const samples = state.rolling.latest(Math.round(state.sampleRate * Math.min(12, modeConfig().stableSeconds)));
@@ -359,6 +500,8 @@ async function runSpectrogram() {
     drawSpectrogram(state.latestSpectrogram);
   } catch (error) {
     console.error(error);
+  } finally {
+    state.spectrogramBusy = false;
   }
 }
 
@@ -371,6 +514,7 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
   const durationSeconds = state.startedAt ? (performance.now() - state.startedAt) / 1000 : 0;
   if (!preserveSummary && state.observations.length) {
     const session = summarizeSession(state.observations, durationSeconds);
+    const sessionReliable = Boolean(session.dominantReliableColor) && session.rejectedPercentage < 20;
     state.lastSummary = {
       ...session,
       id: undefined,
@@ -380,14 +524,21 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
       sourceType: "live-session",
       sampleRate: state.sampleRate,
       durationSeconds,
+      sourceDurationSeconds: durationSeconds,
+      analysisStartSeconds: 0,
+      analysisTruncated: false,
       analysisMode: elements.analysisMode.value,
       analysisWindowSeconds: modeConfig().stableSeconds,
       fitRange: DEFAULT_FIT_RANGE,
       fftSize: FFT_SIZE,
       welchOverlap: WELCH_OVERLAP,
       calibrationProfile: state.activeCalibration?.name || null,
+      calibration: state.latestResult?.calibration || null,
+      corrected: Boolean(state.latestResult?.corrected),
       scalarGainDb: Number(elements.scalarGain.value) || 0,
-      classification: session.dominantReliableColor || "No reliable dominant color",
+      inputRouteLabel: state.inputRouteLabel,
+      microphoneSettings: sanitizeMicrophoneSettings(state.constraintSettings),
+      classification: sessionReliable ? session.dominantReliableColor : "Mixed session / rejected intervals",
       beta: session.betaMean,
       temporalBetaMean: session.betaMean,
       temporalBetaSd: session.betaSd,
@@ -396,7 +547,8 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
       r2: session.fitR2Mean,
       spectralFlatness: session.spectralFlatnessMean,
       confidence: "Session summary",
-      reliable: Boolean(session.dominantReliableColor),
+      reliable: sessionReliable,
+      qualityDetail: sessionReliable ? `${session.reliablePercentage.toFixed(1)}% of session time passed quality gates.` : `${session.rejectedPercentage.toFixed(1)}% of session time was rejected; no single session color is reported.`,
     };
     renderSessionSummary(state.lastSummary);
   }
@@ -405,7 +557,7 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
     try { state.captureNode?.disconnect(); } catch { /* disconnected */ }
     try { state.sourceNode?.disconnect(); } catch { /* disconnected */ }
     try { state.silentGain?.disconnect(); } catch { /* disconnected */ }
-    try { await state.audioContext?.close(); } catch { /* closed */ }
+    await closeAudioContext(state.audioContext);
     await releaseWakeLock();
     state.stream = null;
     state.audioContext = null;
@@ -413,6 +565,10 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
     state.captureNode = null;
     state.silentGain = null;
     state.rolling = null;
+    state.inputRoute = null;
+    state.inputRouteLabel = null;
+    state.constraintSettings = null;
+    selectCalibration();
     elements.startLiveButton.hidden = false;
     elements.stopLiveButton.hidden = true;
     elements.railStatus.innerHTML = "<i></i> LOCAL";
@@ -442,6 +598,8 @@ function renderSessionSummary(summary) {
     ["White-like", formatNumber(percent.white, 0, "%")],
     ["Pink-like", formatNumber(percent.pink, 0, "%")],
     ["Brown/red-like", formatNumber(percent.brown, 0, "%")],
+    ["Reliable time", formatNumber(summary.reliablePercentage, 0, "%")],
+    ["Rejected time", formatNumber(summary.rejectedPercentage, 0, "%")],
     ["Mixed", formatNumber(percent.mixed, 0, "%")],
     ["Tonal", formatNumber(percent.tonal, 0, "%")],
     ["Low signal", formatNumber((percent.silence || 0) + (percent.insufficient || 0), 0, "%")],
@@ -463,13 +621,25 @@ async function startRecording() {
   try {
     if (state.finalizingRecording) throw new Error("The previous recording is still being finalized.");
     if (!("MediaRecorder" in window)) throw new Error("Audio recording is not supported by this browser.");
+    clearAnalysisResults({ resetStatuses: false });
+    state.recordingAnalysisGeneration = state.analysisGeneration;
+    releaseRecordingObject();
     const stream = await startMicrophone({ recording: true });
     const mimeType = chooseRecordingMimeType();
     const recorder = mimeType ? new MediaRecorder(stream, { mimeType }) : new MediaRecorder(stream);
     state.recording = true;
     state.recordingChunks = [];
+    state.recordingBytes = 0;
     state.recorder = recorder;
-    recorder.ondataavailable = (event) => { if (event.data.size) state.recordingChunks.push(event.data); };
+    recorder.ondataavailable = (event) => {
+      if (!event.data.size) return;
+      if (state.recordingBytes + event.data.size > MAX_RECORDING_BYTES) {
+        stopRecording({ interrupted: true, reason: "Recording memory limit reached" });
+        return;
+      }
+      state.recordingChunks.push(event.data);
+      state.recordingBytes += event.data.size;
+    };
     recorder.addEventListener("error", (event) => {
       elements.recordStatus.textContent = event.error?.message || "Recording failed.";
       interruptActiveCapture("Recording interrupted", "unavailable");
@@ -482,8 +652,12 @@ async function startRecording() {
     elements.stopRecordButton.hidden = false;
     elements.downloadAudioButton.hidden = true;
     elements.recordFormat.textContent = recorder.mimeType || "Browser default audio format";
-    elements.recordStatus.textContent = "Recording locally. Stop when ready to analyze.";
-    state.recordTimer = window.setInterval(() => { elements.recordTimer.textContent = formatDuration((performance.now() - state.startedAt) / 1000); }, 250);
+    elements.recordStatus.textContent = `Recording locally for up to ${formatDuration(MAX_RECORDING_SECONDS)}. Stop when ready to analyze.`;
+    state.recordTimer = window.setInterval(() => {
+      const elapsed = (performance.now() - state.startedAt) / 1000;
+      elements.recordTimer.textContent = formatDuration(elapsed);
+      if (elapsed >= MAX_RECORDING_SECONDS) stopRecording({ interrupted: true, reason: "Maximum recording duration reached" });
+    }, 250);
   } catch (error) {
     elements.recordStatus.textContent = error.message;
     state.recording = false;
@@ -502,6 +676,8 @@ async function stopRecording({ interrupted = false, reason = "" } = {}) {
   const capturedDurationSeconds = state.startedAt ? (performance.now() - state.startedAt) / 1000 : 0;
   const fallback = state.rolling?.latest() || new Float32Array();
   const fallbackRate = state.sampleRate;
+  const recordingOptions = currentOptions("recorded-microphone");
+  let audioContext = null;
   try {
     if (recorder.state !== "inactive") {
       const stopped = new Promise((resolve) => recorder.addEventListener("stop", resolve, { once: true }));
@@ -511,13 +687,15 @@ async function stopRecording({ interrupted = false, reason = "" } = {}) {
     state.recording = false;
     state.recorder = null;
     state.recordingBlob = new Blob(state.recordingChunks, { type: recorder.mimeType || "audio/webm" });
+    state.recordingChunks = [];
+    state.recordingBytes = 0;
     if (state.recordingUrl) URL.revokeObjectURL(state.recordingUrl);
     state.recordingUrl = URL.createObjectURL(state.recordingBlob);
     elements.downloadAudioButton.hidden = false;
     elements.recordButton.hidden = false;
     elements.stopRecordButton.hidden = true;
     await stopMicrophone({ preserveSummary: true, silent: true });
-    const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+    audioContext = new (window.AudioContext || window.webkitAudioContext)();
     let samples;
     let sampleRate;
     let decodedFullRecording = true;
@@ -534,23 +712,26 @@ async function stopRecording({ interrupted = false, reason = "" } = {}) {
     const bounded = selectBoundedAnalysisWindow(samples, sampleRate);
     const sourceDurationSeconds = decodedFullRecording ? bounded.sourceDurationSeconds : Math.max(capturedDurationSeconds, bounded.sourceDurationSeconds);
     const analysisStartSeconds = decodedFullRecording ? bounded.analysisStartSeconds : Math.max(0, sourceDurationSeconds - bounded.samples.length / sampleRate);
-    const result = await requestAnalysis("analyze-recording", bounded.samples, sampleRate, currentOptions("recorded-microphone", null, {
+    const result = await requestAnalysis("analyze-recording", bounded.samples, sampleRate, {
+      ...recordingOptions,
       sourceDurationSeconds,
       analysisStartSeconds,
       analysisTruncated: bounded.analysisTruncated || !decodedFullRecording || sourceDurationSeconds > bounded.samples.length / sampleRate + 0.01,
-    }));
+    });
+    if (state.recordingAnalysisGeneration !== state.analysisGeneration) return;
     state.latestResult = result;
     renderResult(elements.recordResult, result);
     renderAdvanced(result);
     const windowNote = result.analysisTruncated ? ` The final ${formatDuration(result.durationSeconds)} of ${formatDuration(result.sourceDurationSeconds)} was analyzed.` : "";
     elements.recordStatus.textContent = `${interrupted ? `${reason || "Recording interrupted"}. ` : ""}Recording analyzed locally.${windowNote} Raw audio remains available only in this page until you leave or download it.`;
-    await audioContext.close();
   } catch (error) {
+    if (state.recordingAnalysisGeneration !== state.analysisGeneration) return;
     elements.recordStatus.textContent = `Recording could not be analyzed: ${error.message}`;
     state.recording = false;
     state.recorder = null;
     await stopMicrophone({ preserveSummary: true, silent: true });
   } finally {
+    await closeAudioContext(audioContext);
     elements.recordButton.hidden = false;
     elements.stopRecordButton.hidden = true;
     elements.stopRecordButton.disabled = false;
@@ -570,32 +751,53 @@ function mixToMono(audioBuffer) {
 
 async function loadAudioFile(file) {
   if (!file) return;
+  if (state.listening) await stopMicrophone({ preserveSummary: true, silent: true });
+  releaseRecordingObject();
+  clearAnalysisResults({ resetStatuses: false });
+  const analysisGeneration = state.analysisGeneration;
+  elements.fileName.textContent = file.name;
+  state.inputRoute = `file:${file.name}`;
+  state.inputRouteLabel = "Uploaded file";
+  state.constraintSettings = null;
+  selectCalibration();
   if (file.size > MAX_FILE_BYTES) {
-    elements.uploadStatus.textContent = "This file is larger than the 100 MB local-analysis limit.";
+    elements.uploadStatus.textContent = "This file is larger than the 40 MB phone-safe local-analysis limit.";
     return;
   }
-  elements.fileName.textContent = file.name;
   elements.uploadStatus.textContent = "Decoding and analyzing locally…";
+  let audioContext = null;
   try {
     const encoded = await file.arrayBuffer();
-    const declaredWavRate = readWavSampleRate(encoded);
-    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-    let audioContext;
-    try { audioContext = declaredWavRate ? new AudioContextClass({ sampleRate: declaredWavRate }) : new AudioContextClass(); }
-    catch { audioContext = new AudioContextClass(); }
-    const decoded = await audioContext.decodeAudioData(encoded);
-    const samples = mixToMono(decoded);
-    state.inputRoute = `file:${file.name}`;
-    const bounded = selectBoundedAnalysisWindow(samples, decoded.sampleRate);
-    const result = await requestAnalysis("analyze-recording", bounded.samples, decoded.sampleRate, currentOptions("uploaded-file", file.name, bounded));
+    const wavTail = decodePcmWavTail(encoded);
+    let bounded;
+    let sampleRate;
+    if (wavTail) {
+      bounded = wavTail;
+      sampleRate = wavTail.sampleRate;
+    } else {
+      const declaredWavRate = readWavSampleRate(encoded);
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      try { audioContext = declaredWavRate ? new AudioContextClass({ sampleRate: declaredWavRate }) : new AudioContextClass(); }
+      catch { audioContext = new AudioContextClass(); }
+      const decoded = await audioContext.decodeAudioData(encoded);
+      bounded = selectBoundedAnalysisWindow(mixToMono(decoded), decoded.sampleRate);
+      sampleRate = decoded.sampleRate;
+    }
+    const result = await requestAnalysis("analyze-recording", bounded.samples, sampleRate, currentOptions("uploaded-file", file.name, bounded));
+    if (analysisGeneration !== state.analysisGeneration) return;
     state.latestResult = result;
     renderResult(elements.uploadResult, result);
     renderAdvanced(result);
     const windowNote = result.analysisTruncated ? ` Analyzed the final ${formatDuration(result.durationSeconds)} of ${formatDuration(result.sourceDurationSeconds)}.` : ` Analyzed ${formatDuration(result.durationSeconds)}.`;
-    elements.uploadStatus.textContent = `${windowNote} ${result.sampleRate} Hz. No audio left this device.`;
-    await audioContext.close();
+    const decodeNote = wavTail ? "PCM WAV was decoded directly from the bounded analysis tail." : "This compressed format required browser decoding before the final analysis window was selected.";
+    elements.uploadStatus.textContent = `${windowNote} ${result.sampleRate} Hz. ${decodeNote} No audio left this device.`;
   } catch (error) {
+    if (analysisGeneration !== state.analysisGeneration) return;
+    clearAnalysisResults({ resetStatuses: false });
+    elements.fileName.textContent = file.name;
     elements.uploadStatus.textContent = `Unsupported or failed audio decode: ${error.message}`;
+  } finally {
+    await closeAudioContext(audioContext);
   }
 }
 
@@ -606,6 +808,67 @@ function readWavSampleRate(arrayBuffer) {
   if (!text.startsWith("RIFF") || !text.includes("WAVE")) return null;
   const rate = new DataView(arrayBuffer).getUint32(24, true);
   return rate >= 4000 && rate <= 384000 ? rate : null;
+}
+
+function decodePcmWavTail(arrayBuffer, maxSeconds = 120) {
+  if (arrayBuffer.byteLength < 44) return null;
+  const view = new DataView(arrayBuffer);
+  const textAt = (offset, length) => String.fromCharCode(...new Uint8Array(arrayBuffer, offset, length));
+  if (textAt(0, 4) !== "RIFF" || textAt(8, 4) !== "WAVE") return null;
+  let format = null;
+  let dataOffset = null;
+  let dataSize = 0;
+  for (let offset = 12; offset + 8 <= arrayBuffer.byteLength;) {
+    const id = textAt(offset, 4);
+    const size = view.getUint32(offset + 4, true);
+    const payload = offset + 8;
+    if (payload + size > arrayBuffer.byteLength) break;
+    if (id === "fmt " && size >= 16) {
+      format = {
+        code: view.getUint16(payload, true),
+        channels: view.getUint16(payload + 2, true),
+        sampleRate: view.getUint32(payload + 4, true),
+        blockAlign: view.getUint16(payload + 12, true),
+        bitsPerSample: view.getUint16(payload + 14, true),
+      };
+    } else if (id === "data") {
+      dataOffset = payload;
+      dataSize = size;
+      break;
+    }
+    offset = payload + size + (size % 2);
+  }
+  if (!format || dataOffset == null || ![1, 3].includes(format.code) || format.channels < 1 || format.channels > 8 || !format.blockAlign || format.sampleRate < 4000 || format.sampleRate > 384000) return null;
+  if ((format.code === 1 && ![8, 16, 24, 32].includes(format.bitsPerSample)) || (format.code === 3 && format.bitsPerSample !== 32)) return null;
+  const totalFrames = Math.floor(dataSize / format.blockAlign);
+  const keptFrames = Math.min(totalFrames, Math.floor(format.sampleRate * maxSeconds));
+  const startFrame = totalFrames - keptFrames;
+  const bytesPerSample = format.bitsPerSample / 8;
+  const samples = new Float32Array(keptFrames);
+  const readSample = (offset) => {
+    if (format.code === 3) return view.getFloat32(offset, true);
+    if (format.bitsPerSample === 8) return (view.getUint8(offset) - 128) / 128;
+    if (format.bitsPerSample === 16) return view.getInt16(offset, true) / 32768;
+    if (format.bitsPerSample === 24) {
+      let value = view.getUint8(offset) | (view.getUint8(offset + 1) << 8) | (view.getUint8(offset + 2) << 16);
+      if (value & 0x800000) value |= 0xff000000;
+      return value / 8388608;
+    }
+    return view.getInt32(offset, true) / 2147483648;
+  };
+  for (let frame = 0; frame < keptFrames; frame += 1) {
+    let mono = 0;
+    const frameOffset = dataOffset + (startFrame + frame) * format.blockAlign;
+    for (let channel = 0; channel < format.channels; channel += 1) mono += readSample(frameOffset + channel * bytesPerSample) / format.channels;
+    samples[frame] = mono;
+  }
+  return {
+    samples,
+    sampleRate: format.sampleRate,
+    sourceDurationSeconds: totalFrames / format.sampleRate,
+    analysisStartSeconds: startFrame / format.sampleRate,
+    analysisTruncated: startFrame > 0,
+  };
 }
 
 function resultMarkup(result) {
@@ -632,7 +895,9 @@ function renderResult(container, result) {
   container.innerHTML = resultMarkup(result);
   container.querySelector('[data-action="save"]').addEventListener("click", async () => {
     await saveMeasurement(result);
-    container.querySelector('[data-action="save"]').textContent = "Saved locally";
+    const button = container.querySelector('[data-action="save"]');
+    button.textContent = "Saved locally";
+    button.disabled = true;
   });
   container.querySelector('[data-action="json"]').addEventListener("click", () => exportJson(result));
   container.querySelector('[data-action="csv"]').addEventListener("click", () => exportCsv(result));
@@ -665,11 +930,15 @@ function exportCsv(result) {
     ["temporal beta mean", result.temporalBetaMean], ["temporal beta SD", result.temporalBetaSd], ["canonical color", result.canonicalColor],
     ["canonical distance", result.canonicalDistance], ["classification", result.classification], ["confidence", result.confidence],
     ["reliable", result.reliable], ["calibration profile", result.calibrationProfile || "uncorrected"], ["scalar gain context dB", result.scalarGainDb],
-    ["input route id", result.inputRouteId], ["microphone settings", result.microphoneSettings ? JSON.stringify(result.microphoneSettings) : ""],
+    ["calibration details", result.calibration ? JSON.stringify(result.calibration) : ""], ["input route", result.inputRouteLabel],
+    ["microphone settings", result.microphoneSettings ? JSON.stringify(result.microphoneSettings) : ""],
+    ["peak prominence dB", result.maxPeakProminenceDb], ["tonal power ratio", result.tonalPowerRatio],
+    ["low-band beta", result.lowBandBeta], ["high-band beta", result.highBandBeta], ["segmented slope delta", result.segmentedSlopeDelta],
+    ["near-clip ratio", result.nearClipRatio], ["plateau ratio", result.plateauRatio], ["crest factor", result.crestFactor], ["limiting suspected", result.limitingSuspected],
   ];
   const rows = metadata.map(([key, value]) => `# ${key},${JSON.stringify(value ?? "")}`);
-  rows.push("", "time_seconds,beta,state,classification,reliable,rmse_db,r_squared,spectral_flatness");
-  for (const item of result.temporalBeta || []) rows.push([item.timeSeconds, item.beta, item.state, JSON.stringify(item.classification), item.reliable, item.rmseDb, item.r2, item.spectralFlatness].join(","));
+  rows.push("", "time_seconds,start_seconds,end_seconds,beta,state,classification,reliable,rmse_db,r_squared,spectral_flatness");
+  for (const item of result.temporalBeta || []) rows.push([item.timeSeconds, item.startSeconds, item.endSeconds, item.beta, item.state, JSON.stringify(item.classification), item.reliable, item.rmseDb, item.r2, item.spectralFlatness].join(","));
   rows.push("", "timeline_start_seconds,timeline_end_seconds,state,classification");
   for (const item of result.colorTimeline || []) rows.push([item.startSeconds, item.endSeconds, item.state, JSON.stringify(item.label || "")].join(","));
   download(`noisecolor-${Date.now()}.csv`, rows.join("\n"), "text/csv");
@@ -749,10 +1018,15 @@ function drawBetaHistory() {
   context.fillStyle = "#718096";
   context.textAlign = "left"; context.fillText("30 sec ago", pad.left, height - 8 * ratio);
   context.textAlign = "right"; context.fillText("now", width - pad.right, height - 8 * ratio);
+  const states = Object.entries(state.betaHistory.reduce((counts, item) => ({ ...counts, [item.state]: (counts[item.state] || 0) + 1 }), {})).map(([name, count]) => `${name} ${count}`).join(", ");
+  const betaValues = reliable.map((item) => item.beta);
+  elements.betaDataSummary.textContent = state.betaHistory.length
+    ? `${state.betaHistory.length} stable-window observations; ${reliable.length} reliable. ${betaValues.length ? `Reliable β range ${Math.min(...betaValues).toFixed(2)} to ${Math.max(...betaValues).toFixed(2)}.` : "No reliable β values."} States: ${states}.`
+    : "No β history is available.";
 }
 
 function drawSpectrum(result) {
-  if (!result?.psd?.frequencies?.length) { drawEmpty(elements.spectrumCanvas, "No spectrum available"); return; }
+  if (!result?.psd?.frequencies?.length) { drawEmpty(elements.spectrumCanvas, "No spectrum available"); elements.spectrumDataSummary.textContent = result?.historyCompacted ? "This history entry stores compact metadata; detailed PSD arrays were intentionally not retained." : "No spectrum data is available."; return; }
   if (state.activeSpectrum === "third") { drawThirdOctave(result); return; }
   const { context, width, height, ratio } = resizeCanvas(elements.spectrumCanvas);
   context.clearRect(0, 0, width, height);
@@ -786,6 +1060,7 @@ function drawSpectrum(result) {
     const db2 = 10 * (result.intercept + result.rawSlope * Math.log10(maxFit));
     context.strokeStyle = "#c6ff5c"; context.lineWidth = 2.5 * ratio; context.beginPath(); context.moveTo(x(minFit), y(db1)); context.lineTo(x(maxFit), y(db2)); context.stroke();
   }
+  elements.spectrumDataSummary.textContent = `${frequencies.length} PSD bins from ${frequencies[1]?.toFixed(1) || "0"} to ${frequencies.at(-1)?.toFixed(1) || "0"} Hz. β ${formatNumber(result.beta)}, fit residual ${formatNumber(result.rmseDb, 2, " dB")}, low/high-band β ${formatNumber(result.lowBandBeta)} / ${formatNumber(result.highBandBeta)}.`;
 }
 
 function drawThirdOctave(result) {
@@ -804,10 +1079,11 @@ function drawThirdOctave(result) {
     context.fillRect(pad.left + index * barWidth + ratio, height - pad.bottom - barHeight, Math.max(ratio, barWidth - 2 * ratio), barHeight);
     if (index % 3 === 0) { context.save(); context.translate(pad.left + index * barWidth + barWidth / 2, height - 9 * ratio); context.rotate(-0.6); context.fillStyle = "#728096"; context.font = `${8 * ratio}px ui-monospace, monospace`; context.textAlign = "right"; context.fillText(band.center >= 1000 ? `${band.center / 1000}k` : band.center, 0, 0); context.restore(); }
   });
+  elements.spectrumDataSummary.textContent = `${bands.length} third-octave context bands from ${bands[0].center} to ${bands.at(-1).center} Hz. These bands do not drive β classification.`;
 }
 
 function drawSpectrogram(spectrogram) {
-  if (!spectrogram?.values?.length) { drawEmpty(elements.spectrogramCanvas, "No spectrogram available"); return; }
+  if (!spectrogram?.values?.length) { drawEmpty(elements.spectrogramCanvas, "No spectrogram available"); elements.spectrogramDataSummary.textContent = "No spectrogram data is available."; return; }
   const { context, width, height } = resizeCanvas(elements.spectrogramCanvas);
   context.clearRect(0, 0, width, height);
   const values = spectrogram.values.flat();
@@ -828,6 +1104,7 @@ function drawSpectrogram(spectrogram) {
       context.fillRect(column * cellWidth, height - (row + 1) * cellHeight, Math.ceil(cellWidth), Math.ceil(cellHeight));
     }
   }
+  elements.spectrogramDataSummary.textContent = `${columns} time frames across ${rows} logarithmically spaced frequencies from ${Math.round(spectrogram.frequencies[0])} to ${Math.round(spectrogram.frequencies.at(-1))} Hz; displayed level range ${low.toFixed(1)} to ${high.toFixed(1)} dB relative.`;
 }
 
 function renderAdvanced(result) {
@@ -839,7 +1116,9 @@ function renderAdvanced(result) {
   }
   const diagnostics = [
     ["β", formatNumber(result.beta)], ["R²", formatNumber(result.r2, 3)], ["RMSE", formatNumber(result.rmseDb, 2, " dB")], ["MAE", formatNumber(result.maeDb, 2, " dB")],
-    ["Flatness", formatNumber(result.spectralFlatness, 3)], ["Level", formatNumber(result.dbfs, 1, " dBFS")], ["Clipping", formatNumber(result.clippingRatio * 100, 3, "%")], ["Fit range", `${result.fitRange?.[0]}–${Math.round(result.fitRange?.[1] || 0)} Hz`],
+    ["Flatness", formatNumber(result.spectralFlatness, 3)], ["Level", formatNumber(result.dbfs, 1, " dBFS")], ["Clipping", formatNumber(result.clippingRatio * 100, 3, "%")], ["Near clip", formatNumber(result.nearClipRatio * 100, 2, "%")],
+    ["Crest factor", formatNumber(result.crestFactor, 2)], ["Peak prominence", formatNumber(result.maxPeakProminenceDb, 1, " dB")], ["Tonal power", formatNumber(result.tonalPowerRatio * 100, 1, "%")], ["Slope delta", formatNumber(result.segmentedSlopeDelta, 2)],
+    ["Fit range", `${result.fitRange?.[0]}–${Math.round(result.fitRange?.[1] || 0)} Hz`],
     ["Sample rate", `${result.sampleRate} Hz`], ["Welch", `${result.fftSize} FFT · ${result.welchOverlap * 100}% overlap`], ["Correction", result.calibrationProfile || "Uncorrected"], ["Engine", `v${result.analysisEngineVersion}`],
   ];
   elements.diagnosticGrid.innerHTML = diagnostics.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
@@ -874,7 +1153,7 @@ function selectCalibration() {
   state.activeCalibration = index === "" ? null : state.calibrationProfiles[Number(index)];
   if (!state.activeCalibration) elements.calibrationState.textContent = "Uncorrected";
   else if (!state.inputRoute) elements.calibrationState.textContent = `Available for ${state.activeCalibration.routeId}; not applied until the input route matches`;
-  else if (state.activeCalibration.routeId !== state.inputRoute) elements.calibrationState.textContent = `Not applied: profile route does not match ${state.inputRoute}`;
+  else if (state.activeCalibration.routeId !== state.inputRoute) elements.calibrationState.textContent = `Not applied: profile does not match ${state.inputRouteLabel || "the current source"}`;
   else elements.calibrationState.textContent = `Corrected with ${state.activeCalibration.name}`;
 }
 
@@ -911,11 +1190,29 @@ const pwa = setupPwa({
 });
 
 document.querySelectorAll("[data-view]").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
-document.querySelectorAll("[data-advanced]").forEach((button) => button.addEventListener("click", () => {
+function activateAdvancedTab(button, { focus = false } = {}) {
   const view = button.dataset.advanced;
-  document.querySelectorAll("[data-advanced]").forEach((tab) => { const active = tab.dataset.advanced === view; tab.classList.toggle("active", active); tab.setAttribute("aria-selected", String(active)); });
+  document.querySelectorAll("[data-advanced]").forEach((tab) => {
+    const active = tab.dataset.advanced === view;
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-selected", String(active));
+    tab.tabIndex = active ? 0 : -1;
+  });
   document.querySelectorAll("[data-advanced-panel]").forEach((panel) => { const active = panel.dataset.advancedPanel === view; panel.hidden = !active; panel.classList.toggle("active", active); });
-}));
+  if (focus) button.focus();
+  if (view === "spectrogram") runSpectrogram();
+}
+document.querySelectorAll("[data-advanced]").forEach((button) => {
+  button.addEventListener("click", () => activateAdvancedTab(button));
+  button.addEventListener("keydown", (event) => {
+    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+    event.preventDefault();
+    const tabs = [...document.querySelectorAll("[data-advanced]")];
+    const current = tabs.indexOf(button);
+    const next = event.key === "Home" ? 0 : event.key === "End" ? tabs.length - 1 : (current + (event.key === "ArrowRight" ? 1 : -1) + tabs.length) % tabs.length;
+    activateAdvancedTab(tabs[next], { focus: true });
+  });
+});
 document.querySelectorAll("[data-spectrum]").forEach((button) => button.addEventListener("click", () => {
   state.activeSpectrum = button.dataset.spectrum;
   document.querySelectorAll("[data-spectrum]").forEach((item) => item.classList.toggle("active", item === button));
@@ -928,6 +1225,7 @@ elements.startLiveButton.addEventListener("click", async () => {
     clearStaleMeasurement("Microphone unavailable", "unavailable", error.message);
   }
 });
+elements.clearButton.addEventListener("click", resetApplication);
 elements.stopLiveButton.addEventListener("click", () => stopMicrophone());
 elements.analysisMode.addEventListener("change", () => {
   elements.windowValue.textContent = `${modeConfig().stableSeconds} sec`;
@@ -944,7 +1242,7 @@ for (const name of ["dragenter", "dragover"]) elements.fileDrop.addEventListener
 for (const name of ["dragleave", "drop"]) elements.fileDrop.addEventListener(name, (event) => { event.preventDefault(); elements.fileDrop.classList.remove("dragging"); });
 elements.fileDrop.addEventListener("drop", (event) => loadAudioFile(event.dataTransfer?.files?.[0]));
 elements.clearHistoryButton.addEventListener("click", async () => { if (window.confirm("Delete all locally saved NoiseColor results?")) { await clearMeasurements(); refreshHistory(); } });
-elements.saveSummaryButton.addEventListener("click", async () => { if (state.lastSummary) { await saveMeasurement(state.lastSummary); elements.saveSummaryButton.textContent = "Saved locally"; } });
+elements.saveSummaryButton.addEventListener("click", async () => { if (state.lastSummary) { await saveMeasurement(state.lastSummary); elements.saveSummaryButton.textContent = "Saved locally"; elements.saveSummaryButton.disabled = true; } });
 elements.exportSummaryButton.addEventListener("click", () => state.lastSummary && exportJson(state.lastSummary));
 elements.exportSummaryCsvButton.addEventListener("click", () => state.lastSummary && exportCsv(state.lastSummary));
 elements.calibrationFile.addEventListener("change", (event) => importCalibration(event.target.files?.[0]));
@@ -965,6 +1263,7 @@ navigator.mediaDevices?.addEventListener?.("devicechange", () => {
   if (state.listening) interruptActiveCapture("Microphone device changed", "paused");
 });
 window.addEventListener("pagehide", () => interruptActiveCapture("Page closed", "paused"));
+window.addEventListener("beforeunload", releaseRecordingObject);
 
 elements.versionLabel.textContent = `NoiseColor v${APP_VERSION} · engine v${ENGINE_VERSION}`;
 loadCalibrationProfiles();

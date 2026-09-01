@@ -51,20 +51,22 @@ A changing EEG exponent and changing eye-movement rates can coexist without esta
 NoiseColor estimates the spectral exponent β in `P(f) ∝ 1/f^β` with Welch power spectral density and a log-log power-law fit. It supports:
 
 - continuous live microphone analysis over HTTPS or localhost, using fast and stable rolling estimators;
-- explicit, opt-in microphone recording with browser-detected recording formats;
+- explicit, opt-in microphone recording with browser-detected recording formats, a two-minute capture cap, and bounded chunk memory;
 - local WAV, MP3, M4A, AAC, OGG, and FLAC files supported by the browser;
 - mono mixing for multichannel files;
-- files up to 100 MB;
+- files up to 40 MB;
 - a bounded final 120-second analysis window for longer recordings/files, with the full source duration and analyzed offset retained in exports;
 - temporal β analysis with mean, standard deviation, history, and a color timeline;
 - continuous PSD, contextual third-octave bands, a live spectrogram, fit diagnostics, spectral flatness, signal level, and clipping checks;
 - optional, named, input-route-specific microphone frequency-response correction profiles;
-- local-only IndexedDB history for metadata and analysis results, never raw audio by default;
-- reproducible JSON and CSV exports containing estimator, fit, quality, source, calibration, and version metadata.
+- local-only IndexedDB history for compact metadata and analysis summaries, never raw audio by default, limited to the 100 most recent saved results and 25 records per read;
+- reproducible JSON and CSV exports containing estimator, fit, quality, source, complete calibration correction points and hash, privacy-safe route labels, and version metadata.
+
+Uncompressed PCM WAV files are parsed directly so only the final bounded analysis window is converted to mono PCM. Browser-supported compressed formats must still be decoded by the browser before NoiseColor can select the final window; the 40 MB file cap reduces but cannot eliminate that unavoidable peak-memory limitation on phones.
 
 The canonical β estimate always uses the **unweighted continuous PSD**. Third-octave and future acoustic weighting views are secondary context only and never drive noise-color classification. Scalar gain/SPL calibration does not materially change β; optional frequency-response correction can change β and is therefore reported transparently.
 
-NoiseColor does not force every sound into a canonical color. Silence, clipping, strongly tonal input, unstable β, insufficient duration, and poor single-power-law fits produce explicit quality states rather than a confident color label. Classification confidence is a model-quality heuristic, not a statistical probability.
+NoiseColor does not force every sound into a canonical color. Silence, clipping or limiting, strongly tonal input, unstable β, insufficient duration, and poor or two-regime single-power-law fits produce explicit quality states rather than a confident color label. Tonality uses flatness plus narrowband peak prominence and tonal-power diagnostics; model adequacy compares log-frequency-binned low/high-band slopes so dense high-frequency bins cannot hide strong curvature. Classification confidence is a model-quality heuristic, not a statistical probability.
 
 Microphones and browser audio processing are not calibrated acoustic measurement chains. Use NoiseColor for exploratory or relative spectral analysis, not sound-pressure-level measurement.
 

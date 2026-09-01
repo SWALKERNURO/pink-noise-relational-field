@@ -14,7 +14,7 @@
   <link rel="manifest" href="./manifest.webmanifest" />
   <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
   <link rel="icon" href="./icons/icon-192.png" />
-  <link rel="stylesheet" href="./styles.css?v=0.5.3" />
+  <link rel="stylesheet" href="./styles.css?v=0.6.1" />
   <title>NoiseColor — Live spectral structure</title>
 </head>
 <body>
@@ -26,6 +26,7 @@
       </a>
       <div class="top-actions">
         <span id="privacyChip" class="privacy-chip">Local analysis</span>
+        <button id="clearButton" class="clear-button" type="button">Clear</button>
         <button id="installButton" class="install-button" type="button">Install NoiseColor</button>
       </div>
     </header>
@@ -76,7 +77,7 @@
             <div class="classification-copy">
               <span id="liveStateLabel" class="status-label">READY</span>
               <strong id="classification">Listening…</strong>
-              <div class="beta-row"><span id="stableBeta">β —</span><small id="confidence">Start live analysis to estimate spectral color</small></div>
+              <div class="beta-row"><span id="stableBeta">Stable β —</span><small id="confidence">Start live analysis to estimate spectral color</small></div>
               <p id="qualityDetail">The stable estimator is the primary result. The faster estimate appears below as secondary context.</p>
             </div>
             <button id="startLiveButton" class="primary-button" type="button">Start Live Analysis</button>
@@ -94,7 +95,8 @@
 
           <section class="chart-card beta-card">
             <div class="card-heading"><div><span class="section-number">01</span><h2>β history</h2></div><small>Stable estimates · last 30 sec</small></div>
-            <canvas id="betaCanvas" width="900" height="300" aria-label="Spectral exponent beta history over the last 30 seconds"></canvas>
+            <canvas id="betaCanvas" width="900" height="300" role="img" aria-label="Spectral exponent beta history over the last 30 seconds" aria-describedby="betaDataSummary"></canvas>
+            <p id="betaDataSummary" class="chart-data-summary">No β history is available.</p>
           </section>
 
           <div id="liveSummary" class="session-summary" hidden>
@@ -126,7 +128,7 @@
           <label id="fileDrop" class="file-drop">
             <input id="audioFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac" />
             <strong>Choose or drop audio</strong>
-            <span id="fileName">WAV, MP3, M4A, AAC, OGG, or FLAC · maximum 100 MB</span>
+            <span id="fileName">WAV, MP3, M4A, AAC, OGG, or FLAC · maximum 40 MB</span>
           </label>
           <div id="uploadStatus" class="inline-status" role="status">Ready for a local audio file.</div>
           <div id="uploadResult" class="result-panel" hidden></div>
@@ -146,21 +148,23 @@
           <h1 id="advancedTitle">See why the label fits—or does not</h1>
           <p class="view-lede">β always comes from the unweighted continuous Welch PSD. Third-octave bands are contextual and never drive noise-color classification.</p>
           <div class="advanced-tabs" role="tablist" aria-label="Scientific analysis views">
-            <button class="advanced-tab active" type="button" data-advanced="spectrum" role="tab" aria-selected="true">Spectrum</button>
-            <button class="advanced-tab" type="button" data-advanced="spectrogram" role="tab" aria-selected="false">Spectrogram</button>
-            <button class="advanced-tab" type="button" data-advanced="diagnostics" role="tab" aria-selected="false">Diagnostics</button>
-            <button class="advanced-tab" type="button" data-advanced="calibration" role="tab" aria-selected="false">Calibration</button>
+            <button id="tabSpectrum" class="advanced-tab active" type="button" data-advanced="spectrum" role="tab" aria-selected="true" aria-controls="panelSpectrum" tabindex="0">Spectrum</button>
+            <button id="tabSpectrogram" class="advanced-tab" type="button" data-advanced="spectrogram" role="tab" aria-selected="false" aria-controls="panelSpectrogram" tabindex="-1">Spectrogram</button>
+            <button id="tabDiagnostics" class="advanced-tab" type="button" data-advanced="diagnostics" role="tab" aria-selected="false" aria-controls="panelDiagnostics" tabindex="-1">Diagnostics</button>
+            <button id="tabCalibration" class="advanced-tab" type="button" data-advanced="calibration" role="tab" aria-selected="false" aria-controls="panelCalibration" tabindex="-1">Calibration</button>
           </div>
-          <div class="advanced-panel active" data-advanced-panel="spectrum">
+          <div id="panelSpectrum" class="advanced-panel active" data-advanced-panel="spectrum" role="tabpanel" aria-labelledby="tabSpectrum">
             <div class="spectrum-toggle"><button class="active" type="button" data-spectrum="psd">Continuous PSD</button><button type="button" data-spectrum="third">1/3-octave context</button></div>
-            <canvas id="spectrumCanvas" width="980" height="430" aria-label="Continuous Welch power spectral density and fitted power-law slope"></canvas>
+            <canvas id="spectrumCanvas" width="980" height="430" role="img" aria-label="Continuous Welch power spectral density and fitted power-law slope" aria-describedby="spectrumDataSummary spectrumNote"></canvas>
+            <p id="spectrumDataSummary" class="chart-data-summary">No spectrum data is available.</p>
             <p id="spectrumNote" class="chart-note">Start Live Analysis or analyze a recording to populate the spectrum.</p>
           </div>
-          <div class="advanced-panel" data-advanced-panel="spectrogram" hidden>
-            <canvas id="spectrogramCanvas" width="980" height="430" aria-label="Time-frequency spectrogram"></canvas>
+          <div id="panelSpectrogram" class="advanced-panel" data-advanced-panel="spectrogram" role="tabpanel" aria-labelledby="tabSpectrogram" hidden>
+            <canvas id="spectrogramCanvas" width="980" height="430" role="img" aria-label="Time-frequency spectrogram" aria-describedby="spectrogramDataSummary"></canvas>
+            <p id="spectrogramDataSummary" class="chart-data-summary">No spectrogram data is available.</p>
             <p class="chart-note">The spectrogram reveals tones, harmonics, and time-varying structure that one β cannot summarize.</p>
           </div>
-          <div class="advanced-panel" data-advanced-panel="diagnostics" hidden>
+          <div id="panelDiagnostics" class="advanced-panel" data-advanced-panel="diagnostics" role="tabpanel" aria-labelledby="tabDiagnostics" hidden>
             <div id="diagnosticGrid" class="diagnostic-grid"></div>
             <div class="measured-interpretation">
               <div><span>MEASURED</span><p id="measuredCopy">No measurement yet.</p></div>
@@ -168,7 +172,7 @@
               <div><span>OPEN QUESTION</span><p>Does one stationary power law adequately describe this sound source over the selected range?</p></div>
             </div>
           </div>
-          <div class="advanced-panel" data-advanced-panel="calibration" hidden>
+          <div id="panelCalibration" class="advanced-panel" data-advanced-panel="calibration" role="tabpanel" aria-labelledby="tabCalibration" hidden>
             <div class="calibration-grid">
               <div class="calibration-copy">
                 <h2>Frequency-response correction</h2>
@@ -196,7 +200,7 @@
         <section><span class="rail-number">01</span><h2>Measured</h2><div id="railMeasured">No live measurement yet.</div></section>
         <section><span class="rail-number">02</span><h2>Interpretation</h2><p id="railInterpretation">A canonical color appears only after the stable estimator passes silence, clipping, tonal, stability, and fit-quality gates.</p></section>
         <section><span class="rail-number dim">03</span><h2>Question</h2><p>Is the current sound genuinely broadband and scale-like, or is one β hiding tones and change over time?</p></section>
-        <footer><strong>PRIVATE BY DESIGN</strong><p>Audio is analyzed locally and is not uploaded to a server.</p><small id="versionLabel">NoiseColor v0.5.3</small></footer>
+        <footer><strong>PRIVATE BY DESIGN</strong><p>Audio is analyzed locally and is not uploaded to a server.</p><small id="versionLabel">NoiseColor v0.6.1</small></footer>
       </aside>
     </main>
 
@@ -216,6 +220,6 @@
   </div>
 
   <noscript>NoiseColor requires JavaScript for local audio analysis.</noscript>
-  <script type="module" src="./app.js?v=0.5.3"></script>
+  <script type="module" src="./app.js?v=0.6.1"></script>
 </body>
 </html>

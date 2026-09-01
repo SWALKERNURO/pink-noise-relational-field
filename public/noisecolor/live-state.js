@@ -1,4 +1,4 @@
-import { CANONICAL_COLORS, nearestCanonical } from "./analysis-engine.js?v=0.5.3";
+import { CANONICAL_COLORS, nearestCanonical } from "./analysis-engine.js?v=0.6.1";
 
 const BLOCKING_STATES = new Set(["silence", "tonal", "mixed", "unstable", "clipping", "insufficient", "invalid", "paused", "unavailable", "listening"]);
 
@@ -59,21 +59,26 @@ export class ColorStateMachine {
     } else {
       this.pendingState = null;
       this.pendingCount = 0;
-      this.label = nearest.label;
+      this.label = CANONICAL_COLORS.find((color) => color.key === this.state)?.label || nearest.label;
     }
     return this.snapshot(measurement);
   }
 
   snapshot(measurement) {
+    const canonical = CANONICAL_COLORS.find((color) => color.key === this.state);
+    const reliable = Boolean(canonical);
+    const detail = reliable && Number.isFinite(this.displayBeta)
+      ? `Smoothed stable β ${this.displayBeta.toFixed(2)} is reported as ${canonical.label}; latest stable-window β ${Number.isFinite(measurement?.beta) ? measurement.beta.toFixed(2) : "—"}.${this.pendingState ? " A possible transition is still being confirmed." : ""}`
+      : measurement?.qualityDetail || "";
     return {
       state: this.state,
-      label: this.label,
+      label: reliable ? canonical.label : this.label,
       displayBeta: this.displayBeta,
       rawBeta: measurement?.beta ?? null,
-      reliable: CANONICAL_COLORS.some((color) => color.key === this.state),
+      reliable,
       pendingState: this.pendingState,
-      confidence: measurement?.confidence || "None",
-      detail: measurement?.qualityDetail || "",
+      confidence: this.pendingState ? "Provisional" : measurement?.confidence || "None",
+      detail,
     };
   }
 }

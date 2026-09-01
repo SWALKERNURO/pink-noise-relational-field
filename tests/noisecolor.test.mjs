@@ -14,6 +14,7 @@ import {
 } from "../public/noisecolor/analysis-engine.js";
 import { ColorStateMachine } from "../public/noisecolor/live-state.js";
 import { MODE_CONFIG, RollingBuffer, selectBoundedAnalysisWindow } from "../public/noisecolor/live-runtime.js";
+import { compactMeasurement, HISTORY_PAGE_SIZE, HISTORY_RETENTION_LIMIT } from "../public/noisecolor/history.js";
 
 function randomGenerator(seed = 123456789) {
   let value = seed >>> 0;
@@ -66,6 +67,24 @@ function piecewiseNoise({ sampleRate = 16000, size = 65536, seed = 19 } = {}) {
   return Float32Array.from(real, (sample) => (sample / currentRms) * 0.18);
 }
 
+function twoRegimeNoise({ sampleRate = 16000, size = 65536, seed = 73, breakpoint = 1000 } = {}) {
+  const random = randomGenerator(seed);
+  const real = new Float64Array(size);
+  const imaginary = new Float64Array(size);
+  for (let bin = 1; bin < size / 2; bin += 1) {
+    const frequency = (bin * sampleRate) / size;
+    const magnitude = frequency < breakpoint ? 1 : (frequency / breakpoint) ** -1;
+    const phase = random() * 2 * Math.PI;
+    real[bin] = magnitude * Math.cos(phase);
+    imaginary[bin] = magnitude * Math.sin(phase);
+    real[size - bin] = real[bin];
+    imaginary[size - bin] = -imaginary[bin];
+  }
+  fftInPlace(real, imaginary, true);
+  const currentRms = Math.sqrt(real.reduce((sum, sample) => sum + sample * sample, 0) / size);
+  return Float32Array.from(real, (sample) => (sample / currentRms) * 0.16);
+}
+
 const analysisOptions = { fitRange: [100, 7000], analysisMode: "test" };
 
 test("FFT agrees with an independent direct DFT and round-trips", () => {
@@ -114,6 +133,23 @@ test("white-noise classification does not require a large R squared", () => {
   assert.ok(result.r2 < 0.25, `white-noise R² should naturally be low, received ${result.r2}`);
 });
 
+test("strong tonal mixtures cannot receive a confident broadband color label", () => {
+  const broadband = coloredNoise(0, { seed: 145, rms: 0.1 });
+  const mixed = Float32Array.from(broadband, (sample, index) => sample + 0.16 * Math.sin((2 * Math.PI * 1000 * index) / 16000));
+  const result = analyzeSamples(mixed, 16000, analysisOptions);
+  assert.equal(result.state, "tonal");
+  assert.equal(result.reliable, false);
+  assert.ok(result.maxPeakProminenceDb >= 15);
+  assert.ok(result.tonalPowerRatio >= 0.06);
+});
+
+test("two-regime spectra fail the single-power-law adequacy gate", () => {
+  const result = analyzeSamples(twoRegimeNoise(), 16000, analysisOptions);
+  assert.equal(result.state, "mixed");
+  assert.equal(result.reliable, false);
+  assert.ok(result.segmentedSlopeDelta > 0.75);
+});
+
 test("quality gates reject tonal input, silence, clipping, and short input", () => {
   const tonal = analyzeSamples(sineWave(1000), 16000, analysisOptions);
   assert.equal(tonal.state, "tonal");
@@ -129,6 +165,16 @@ test("quality gates reject tonal input, silence, clipping, and short input", () 
 
   const short = analyzeSamples(coloredNoise(1, { size: 16384, seed: 8 }).subarray(0, 8000), 16000, analysisOptions);
   assert.equal(short.state, "insufficient");
+});
+
+test("mobile-style limiting below full scale is reported conservatively", () => {
+  const source = coloredNoise(0, { seed: 602, rms: 0.2 });
+  const limited = Float32Array.from(source, (sample) => Math.max(-0.8, Math.min(0.8, sample * 12)));
+  const result = analyzeSamples(limited, 16000, analysisOptions);
+  assert.equal(result.clippingRatio, 0);
+  assert.equal(result.limitingSuspected, true);
+  assert.equal(result.state, "clipping");
+  assert.match(result.qualityDetail, /clipped or aggressively limited/i);
 });
 
 test("quality gates reject non-finite and poor single-power-law signals", () => {
@@ -153,6 +199,21 @@ test("temporal analysis flags a changing exponent as unstable", () => {
   assert.ok(result.temporalBeta.length >= 6);
   assert.ok(result.temporalBetaSd > 0.55, `expected unstable β, received SD ${result.temporalBetaSd}`);
   assert.equal(result.state, "unstable");
+});
+
+test("intermittent silence is represented by actual analyzed time", () => {
+  const sampleRate = 16384;
+  const silence = new Float32Array(sampleRate * 4);
+  const pink = coloredNoise(1, { sampleRate, size: 65536, seed: 222, rms: 0.18 });
+  const samples = new Float32Array(silence.length + pink.length);
+  samples.set(silence);
+  samples.set(pink, silence.length);
+  const result = analyzeRecording(samples, sampleRate, { ...analysisOptions, temporalWindowSeconds: 2, temporalStepSeconds: 2 });
+  assert.ok(Math.abs(result.sessionSummary.percentages.silence - 50) < 2, `expected about 50% silence, received ${result.sessionSummary.percentages.silence}`);
+  assert.ok(Math.abs(result.sessionSummary.rejectedPercentage - 50) < 2);
+  assert.equal(result.reliable, false);
+  assert.equal(result.state, "silence");
+  assert.ok(result.temporalBeta.every((item) => Number.isFinite(item.rmseDb) && Number.isFinite(item.r2) && Number.isFinite(item.spectralFlatness)));
 });
 
 test("low sample-rate analysis caps the fit range below Nyquist", () => {
@@ -248,12 +309,12 @@ test("session timelines end at the session duration and percentages are time-wei
   ];
   const timeline = buildColorTimeline(observations, 10);
   assert.deepEqual(timeline.map(({ state, startSeconds, endSeconds }) => ({ state, startSeconds, endSeconds })), [
-    { state: "white", startSeconds: 0, endSeconds: 4 },
-    { state: "pink", startSeconds: 4, endSeconds: 10 },
+    { state: "white", startSeconds: 0, endSeconds: 3 },
+    { state: "pink", startSeconds: 3, endSeconds: 10 },
   ]);
   const summary = summarizeSession(observations, 10);
-  assert.equal(summary.percentages.white, 40);
-  assert.equal(summary.percentages.pink, 60);
+  assert.equal(summary.percentages.white, 30);
+  assert.equal(summary.percentages.pink, 70);
   assert.equal(summary.dominantReliableColor, "Pink-like");
 });
 
@@ -276,6 +337,10 @@ test("live color state machine uses consecutive observations and clears stale co
   assert.equal(white.state, "white");
   const firstPink = machine.update(measurement(0.95, "pink", "Pink-like"));
   assert.equal(firstPink.state, "white");
+  assert.equal(firstPink.label, "White-like");
+  assert.equal(firstPink.confidence, "Provisional");
+  assert.match(firstPink.detail, /Smoothed stable β/);
+  assert.match(firstPink.detail, /White-like/);
   const pink = machine.update(measurement(0.95, "pink", "Pink-like"));
   assert.equal(pink.state, "pink");
   const silence = machine.update({ beta: 0.95, state: "silence", classification: "Signal too low", reliable: false, qualityDetail: "Quiet." });
@@ -326,6 +391,19 @@ test("NoiseColor PWA paths and mobile lifecycle contracts stay scoped", async ()
   assert.match(app, /document\.addEventListener\("visibilitychange"/);
   assert.match(app, /addEventListener\?\.\("devicechange"/);
   assert.match(app, /window\.addEventListener\("pagehide"/);
+  assert.match(app, /AUDIO_CONTEXT_START_TIMEOUT_MS/);
+  assert.match(app, /Promise\.race/);
+  assert.match(app, /audioContext\.state !== "running"/);
+  assert.match(app, /await closeAudioContext\(audioContext\)/);
+  assert.match(app, /MAX_RECORDING_SECONDS/);
+  assert.match(app, /MAX_RECORDING_BYTES/);
+  assert.match(app, /decodePcmWavTail/);
+  assert.match(app, /state\.workerBusy/);
+  assert.match(html, /id="clearButton"/);
+  assert.match(html, /role="tabpanel"/);
+  assert.match(html, /aria-controls="panelSpectrum"/);
+  assert.match(html, /aria-describedby="betaDataSummary"/);
+  assert.match(styles, /\.file-drop:focus-within/);
   assert.match(serviceWorker, new RegExp(`const VERSION = ["']${APP_VERSION}["']`));
   assert.match(app, new RegExp(`analysis-engine\\.js\\?v=${APP_VERSION}`));
   assert.match(app, new RegExp(`analysis-worker\\.js\\?v=${APP_VERSION}`));
@@ -345,8 +423,61 @@ test("exports and privacy metadata are versioned and local-first", async () => {
   ]);
   assert.match(html, /Audio is analyzed locally and is not uploaded to a server\./);
   assert.match(readme, /Audio is analyzed locally and is not uploaded to a server\./);
-  const result = analyzeSamples(coloredNoise(1, { seed: 77 }), 16000, { ...analysisOptions, scalarGainDb: 3.5, inputRouteId: "test-mic" });
+  const result = analyzeSamples(coloredNoise(1, { seed: 77 }), 16000, {
+    ...analysisOptions,
+    scalarGainDb: 3.5,
+    inputRouteId: "persistent-device-id",
+    inputRouteLabel: "Microphone · current session",
+    microphoneSettings: { deviceId: "persistent-device-id", groupId: "persistent-group-id", sampleRate: 16000, channelCount: 1 },
+  });
   assert.equal(result.scalarGainDb, 3.5);
-  assert.equal(result.inputRouteId, "test-mic");
+  assert.equal(result.inputRouteId, undefined);
+  assert.equal(result.inputRouteLabel, "Microphone · current session");
+  assert.equal(result.microphoneSettings.deviceId, undefined);
+  assert.equal(result.microphoneSettings.groupId, undefined);
+  assert.equal(result.microphoneSettings.sampleRate, 16000);
   assert.equal(result.corrected, false);
+});
+
+test("calibration exports include deterministic correction data without route identifiers", () => {
+  const profile = { name: "Reference mic", routeId: "persistent-device-id", points: [{ frequency: 100, correctionDb: 2 }, { frequency: 7000, correctionDb: -1 }] };
+  const result = analyzeSamples(coloredNoise(1, { seed: 902 }), 16000, { ...analysisOptions, calibrationProfile: profile, inputRouteId: profile.routeId });
+  assert.equal(result.corrected, true);
+  assert.equal(result.calibration.applied, true);
+  assert.deepEqual(result.calibration.points, profile.points);
+  assert.match(result.calibration.correctionHash, /^fnv1a32-[0-9a-f]{8}$/);
+  assert.equal(result.calibration.routeId, undefined);
+});
+
+test("history compaction bounds detail arrays and removes persistent identifiers", () => {
+  const record = compactMeasurement({
+    timestamp: "2026-09-01T00:00:00.000Z",
+    sourceType: "live-session",
+    inputRouteId: "persistent-device-id",
+    microphoneSettings: { deviceId: "persistent-device-id", groupId: "persistent-group-id", sampleRate: 48000 },
+    psd: { frequencies: [1, 2], power: [3, 4] },
+    spectrogram: { values: [[1]] },
+    thirdOctave: [{ center: 100, power: 1 }],
+    temporalBeta: Array.from({ length: 1000 }, (_, index) => ({ timeSeconds: index, beta: 1 })),
+  });
+  assert.equal(record.psd, undefined);
+  assert.equal(record.spectrogram, undefined);
+  assert.equal(record.thirdOctave, undefined);
+  assert.equal(record.inputRouteId, undefined);
+  assert.equal(record.microphoneSettings.deviceId, undefined);
+  assert.equal(record.microphoneSettings.groupId, undefined);
+  assert.equal(record.temporalBeta.length, 600);
+  assert.equal(record.historyCompacted, true);
+  assert.equal(HISTORY_PAGE_SIZE, 25);
+  assert.equal(HISTORY_RETENTION_LIMIT, 100);
+});
+
+test("upload rejection and Clear reset stale result surfaces before reporting failure", async () => {
+  const app = await readFile(new URL("../public/noisecolor/app.js", import.meta.url), "utf8");
+  const upload = app.slice(app.indexOf("async function loadAudioFile"), app.indexOf("function readWavSampleRate"));
+  assert.ok(upload.indexOf("clearAnalysisResults") < upload.indexOf("file.size > MAX_FILE_BYTES"));
+  assert.match(upload, /catch \(error\) \{\s*if \(analysisGeneration !== state\.analysisGeneration\) return;\s*clearAnalysisResults/);
+  assert.match(app, /async function resetApplication\(\)/);
+  assert.match(app, /releaseRecordingObject\(\)/);
+  assert.match(app, /elements\.clearButton\.addEventListener\("click", resetApplication\)/);
 });

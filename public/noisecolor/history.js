@@ -1,6 +1,9 @@
 const DATABASE_NAME = "noisecolor-local-history";
-const DATABASE_VERSION = 1;
+const DATABASE_VERSION = 2;
 const STORE_NAME = "measurements";
+export const HISTORY_RETENTION_LIMIT = 100;
+export const HISTORY_PAGE_SIZE = 25;
+const MAX_TEMPORAL_POINTS = 600;
 
 function openDatabase() {
   return new Promise((resolve, reject) => {
@@ -11,53 +14,137 @@ function openDatabase() {
     const request = indexedDB.open(DATABASE_NAME, DATABASE_VERSION);
     request.onupgradeneeded = () => {
       const database = request.result;
-      if (!database.objectStoreNames.contains(STORE_NAME)) {
-        const store = database.createObjectStore(STORE_NAME, { keyPath: "id" });
-        store.createIndex("timestamp", "timestamp");
-      }
+      const store = database.objectStoreNames.contains(STORE_NAME)
+        ? request.transaction.objectStore(STORE_NAME)
+        : database.createObjectStore(STORE_NAME, { keyPath: "id" });
+      if (!store.indexNames.contains("timestamp")) store.createIndex("timestamp", "timestamp");
     };
     request.onsuccess = () => resolve(request.result);
     request.onerror = () => reject(request.error || new Error("Could not open local history."));
   });
 }
 
-async function transact(mode, operation) {
+function transactionComplete(transaction) {
+  return new Promise((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onabort = () => reject(transaction.error || new Error("History transaction was aborted."));
+    transaction.onerror = () => reject(transaction.error || new Error("History transaction failed."));
+  });
+}
+
+function sampleEvenly(values, maximum = MAX_TEMPORAL_POINTS) {
+  if (!Array.isArray(values) || values.length <= maximum) return values || [];
+  return Array.from({ length: maximum }, (_, index) => values[Math.round((index * (values.length - 1)) / (maximum - 1))]);
+}
+
+export function sanitizeMicrophoneSettings(settings) {
+  if (!settings || typeof settings !== "object") return null;
+  return Object.fromEntries(Object.entries(settings).filter(([key]) => !["deviceId", "groupId"].includes(key)));
+}
+
+export function compactMeasurement(result) {
+  const {
+    psd: _psd,
+    spectrogram: _spectrogram,
+    thirdOctave: _thirdOctave,
+    inputRouteId: _inputRouteId,
+    ...metadata
+  } = result || {};
+  return {
+    ...metadata,
+    temporalBeta: sampleEvenly(metadata.temporalBeta),
+    colorTimeline: sampleEvenly(metadata.colorTimeline),
+    microphoneSettings: sanitizeMicrophoneSettings(metadata.microphoneSettings),
+    historyCompacted: true,
+    historyDetailArraysStored: false,
+  };
+}
+
+async function enforceRetention() {
   const database = await openDatabase();
   try {
-    return await new Promise((resolve, reject) => {
-      const transaction = database.transaction(STORE_NAME, mode);
-      const request = operation(transaction.objectStore(STORE_NAME));
-      let result;
-      request.onsuccess = () => { result = request.result; };
-      request.onerror = () => reject(request.error || new Error("History operation failed."));
-      transaction.oncomplete = () => resolve(result);
-      transaction.onabort = () => reject(transaction.error || new Error("History transaction was aborted."));
-      transaction.onerror = () => reject(transaction.error || new Error("History transaction failed."));
-    });
+    const transaction = database.transaction(STORE_NAME, "readwrite");
+    const store = transaction.objectStore(STORE_NAME);
+    const countRequest = store.count();
+    countRequest.onsuccess = () => {
+      let excess = Math.max(0, countRequest.result - HISTORY_RETENTION_LIMIT);
+      if (!excess) return;
+      const cursorRequest = store.index("timestamp").openCursor(null, "next");
+      cursorRequest.onsuccess = () => {
+        const cursor = cursorRequest.result;
+        if (!cursor || excess <= 0) return;
+        cursor.delete();
+        excess -= 1;
+        cursor.continue();
+      };
+    };
+    await transactionComplete(transaction);
   } finally {
     database.close();
   }
 }
 
 export async function saveMeasurement(result) {
+  const compacted = compactMeasurement(result);
+  const timestamp = compacted.timestamp || new Date().toISOString();
   const record = {
-    ...result,
-    id: result.id || crypto.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    timestamp: result.timestamp || new Date().toISOString(),
+    ...compacted,
+    id: compacted.id || `result-${timestamp}-${compacted.sourceType || "unknown"}`,
+    timestamp,
   };
-  await transact("readwrite", (store) => store.put(record));
+  const database = await openDatabase();
+  try {
+    const transaction = database.transaction(STORE_NAME, "readwrite");
+    transaction.objectStore(STORE_NAME).put(record);
+    await transactionComplete(transaction);
+  } finally {
+    database.close();
+  }
+  await enforceRetention();
   return record;
 }
 
-export async function listMeasurements() {
-  const records = await transact("readonly", (store) => store.getAll());
-  return records.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
+export async function listMeasurements({ limit = HISTORY_PAGE_SIZE, offset = 0 } = {}) {
+  const maximum = Math.max(1, Math.min(HISTORY_PAGE_SIZE, Math.floor(limit) || HISTORY_PAGE_SIZE));
+  const skip = Math.max(0, Math.floor(offset) || 0);
+  const database = await openDatabase();
+  try {
+    return await new Promise((resolve, reject) => {
+      const records = [];
+      let seen = 0;
+      const request = database.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).index("timestamp").openCursor(null, "prev");
+      request.onsuccess = () => {
+        const cursor = request.result;
+        if (!cursor || records.length >= maximum) {
+          resolve(records);
+          return;
+        }
+        if (seen >= skip) records.push(cursor.value);
+        seen += 1;
+        cursor.continue();
+      };
+      request.onerror = () => reject(request.error || new Error("History read failed."));
+    });
+  } finally {
+    database.close();
+  }
+}
+
+async function deleteOperation(operation) {
+  const database = await openDatabase();
+  try {
+    const transaction = database.transaction(STORE_NAME, "readwrite");
+    operation(transaction.objectStore(STORE_NAME));
+    await transactionComplete(transaction);
+  } finally {
+    database.close();
+  }
 }
 
 export async function deleteMeasurement(id) {
-  await transact("readwrite", (store) => store.delete(id));
+  await deleteOperation((store) => store.delete(id));
 }
 
 export async function clearMeasurements() {
-  await transact("readwrite", (store) => store.clear());
+  await deleteOperation((store) => store.clear());
 }
