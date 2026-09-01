@@ -106,6 +106,15 @@ p { line-height: 1.55; }
 .button-primary { background: var(--accent-strong); color: #03111b; border-color: transparent; }
 .button-primary:hover:not(:disabled) { background: #67d2fb; }
 .button-quiet { background: transparent; }
+.source-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0; color: #74819a; font-size: .72rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
+.source-divider::before, .source-divider::after { content: ""; height: 1px; flex: 1; background: var(--line); }
+.file-drop { position: relative; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 14px; min-height: 78px; padding: 14px; border: 1px dashed rgba(125, 211, 252, .38); border-radius: 16px; background: rgba(125, 211, 252, .035); cursor: pointer; transition: border-color .15s ease, background .15s ease; }
+.file-drop:hover, .file-drop.dragging, .file-drop:focus-within { border-color: var(--accent); background: rgba(125, 211, 252, .075); }
+.file-input { position: absolute; inline-size: 1px; block-size: 1px; opacity: 0; pointer-events: none; }
+.file-action { min-height: 42px; display: inline-flex; align-items: center; justify-content: center; padding: 0 14px; border-radius: 12px; background: rgba(255,255,255,.08); color: var(--text); font-weight: 750; }
+.file-copy { display: grid; gap: 4px; min-width: 0; }
+.file-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .9rem; }
+.file-copy small { color: var(--muted); line-height: 1.4; }
 .status { margin-top: 14px; color: var(--muted); min-height: 24px; }
 .level-wrap { display: flex; align-items: center; gap: 12px; margin-top: 12px; color: var(--muted); font-size: .82rem; }
 .level-track { flex: 1; height: 8px; background: rgba(255,255,255,.06); border-radius: 99px; overflow: hidden; }
@@ -177,7 +186,7 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
       <div class="section-heading">
         <div>
           <p class="section-kicker">Capture</p>
-          <h2 id="recording-title">Microphone recording</h2>
+          <h2 id="recording-title">Microphone or audio file</h2>
         </div>
         <div class="timer" id="timer">00:00.0</div>
       </div>
@@ -188,7 +197,15 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
         <button id="clearBtn" class="button button-quiet" disabled>Clear</button>
       </div>
 
-      <div id="status" class="status" role="status" aria-live="polite">Ready. Microphone permission will be requested when you start.</div>
+      <div class="source-divider"><span>or analyze a file</span></div>
+
+      <label id="fileDrop" class="file-drop">
+        <input id="audioFile" class="file-input" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac" />
+        <span class="file-action">Choose audio</span>
+        <span class="file-copy"><strong id="fileName">Drop a file here</strong><small>WAV, MP3, M4A, AAC, OGG, or FLAC · up to 100 MB</small></span>
+      </label>
+
+      <div id="status" class="status" role="status" aria-live="polite">Ready. Record from the microphone or choose an audio file.</div>
 
       <div class="level-wrap" aria-label="Microphone input level">
         <div class="level-track"><div id="levelBar" class="level-bar"></div></div>
@@ -326,6 +343,7 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
   'use strict';
 
   const MAX_CAPTURE_SECONDS = 120;
+  const MAX_FILE_BYTES = 100 * 1024 * 1024;
   const MIN_ANALYSIS_SECONDS = 3;
   const WELCH_SIZE = 4096;
   const WELCH_OVERLAP = 0.5;
@@ -334,6 +352,9 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
     startBtn: document.getElementById('startBtn'),
     stopBtn: document.getElementById('stopBtn'),
     clearBtn: document.getElementById('clearBtn'),
+    audioFile: document.getElementById('audioFile'),
+    fileDrop: document.getElementById('fileDrop'),
+    fileName: document.getElementById('fileName'),
     jsonBtn: document.getElementById('jsonBtn'),
     csvBtn: document.getElementById('csvBtn'),
     status: document.getElementById('status'),
@@ -369,6 +390,8 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
     sampleRate: null,
     recording: false,
     startedAt: null,
+    sourceType: null,
+    sourceName: null,
     raf: null,
     timerId: null,
     analysisTimer: null,
@@ -437,6 +460,8 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
       if (state.audioContext.state === 'suspended') await state.audioContext.resume();
 
       state.sampleRate = state.audioContext.sampleRate;
+      state.sourceType = 'microphone';
+      state.sourceName = null;
       state.source = state.audioContext.createMediaStreamSource(state.stream);
       state.analyser = state.audioContext.createAnalyser();
       state.analyser.fftSize = 2048;
@@ -467,6 +492,80 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
       setStatus(message, 'error');
       els.startBtn.disabled = false;
       els.stopBtn.disabled = true;
+    }
+  }
+
+  async function loadAudioFile(file) {
+    if (!file) return;
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) {
+      setStatus('This browser cannot decode audio files with the Web Audio API.', 'error');
+      return;
+    }
+    if (file.size > MAX_FILE_BYTES) {
+      setStatus('Choose an audio file smaller than 100 MB.', 'error');
+      return;
+    }
+
+    els.startBtn.disabled = true;
+    els.audioFile.disabled = true;
+    els.fileName.textContent = file.name;
+    setStatus(`Decoding ${file.name}…`);
+
+    try {
+      resetMeasurement(false);
+      stopMediaTracks();
+      const context = new AudioCtx();
+      const encoded = await file.arrayBuffer();
+      const decoded = await context.decodeAudioData(encoded.slice(0));
+      const retainedSamples = Math.min(decoded.length, Math.floor(decoded.sampleRate * MAX_CAPTURE_SECONDS));
+      const sourceStart = decoded.length - retainedSamples;
+      const mono = new Float32Array(retainedSamples);
+
+      for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
+        const channelData = decoded.getChannelData(channel);
+        for (let index = 0; index < retainedSamples; index++) {
+          mono[index] += channelData[sourceStart + index] / decoded.numberOfChannels;
+        }
+      }
+
+      await context.close();
+      state.chunks = [mono];
+      state.totalSamples = mono.length;
+      state.sampleRate = decoded.sampleRate;
+      state.sourceType = 'file';
+      state.sourceName = file.name;
+      state.startedAt = null;
+
+      const retainedSeconds = mono.length / decoded.sampleRate;
+      const truncated = decoded.duration > retainedSeconds + 0.01;
+      els.timer.textContent = formatDuration(retainedSeconds);
+      els.sampleRateLabel.textContent = `Sample rate ${Math.round(state.sampleRate / 100) / 10} kHz`;
+      els.clearBtn.disabled = false;
+      els.levelBar.style.width = '0%';
+      els.levelText.textContent = `File · ${decoded.numberOfChannels} channel${decoded.numberOfChannels === 1 ? '' : 's'}`;
+
+      if (retainedSeconds < MIN_ANALYSIS_SECONDS) {
+        setStatus(`The decoded file is ${retainedSeconds.toFixed(1)} s; at least ${MIN_ANALYSIS_SECONDS} s is required.`, 'warn');
+        return;
+      }
+
+      runAnalysis();
+      setStatus(
+        truncated
+          ? `Analyzed the final ${MAX_CAPTURE_SECONDS} seconds of ${file.name}. Adjust the fit range or analysis window to explore the result.`
+          : `Analyzed ${file.name}. Adjust the fit range or analysis window to explore the result.`,
+        'good'
+      );
+    } catch (err) {
+      console.error(err);
+      resetMeasurement(false);
+      els.fileName.textContent = 'Drop a file here';
+      setStatus(`Could not decode ${file.name}. Try WAV, MP3, M4A, AAC, OGG, or FLAC supported by this browser.`, 'error');
+    } finally {
+      els.startBtn.disabled = false;
+      els.audioFile.disabled = false;
+      els.audioFile.value = '';
     }
   }
 
@@ -573,6 +672,8 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
     state.totalSamples = 0;
     state.result = null;
     state.startedAt = null;
+    state.sourceType = null;
+    state.sourceName = null;
     els.timer.textContent = '00:00.0';
     els.classification.textContent = '—';
     els.classificationNote.textContent = 'Record at least 3 seconds of relatively stationary sound.';
@@ -584,7 +685,9 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
     els.csvBtn.disabled = true;
     if (full) {
       els.sampleRateLabel.textContent = 'Sample rate —';
-      setStatus('Ready. Microphone permission will be requested when you start.');
+      els.fileName.textContent = 'Drop a file here';
+      els.levelText.textContent = 'Input —';
+      setStatus('Ready. Record from the microphone or choose an audio file.');
     }
     clearCanvas(els.spectrumCanvas, 'Record audio to see the power spectrum');
     clearCanvas(els.waveCanvas, 'Waveform');
@@ -619,6 +722,8 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
 
     state.result = {
       timestamp: new Date().toISOString(),
+      sourceType: state.sourceType,
+      sourceName: state.sourceName,
       durationSeconds: samples.length / state.sampleRate,
       sampleRateHz: state.sampleRate,
       fitRangeHz: [minFreq, maxFreq],
@@ -958,6 +1063,8 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
     const rows = [
       ['# NoiseColor measurement'],
       ['# timestamp', r.timestamp],
+      ['# source_type', r.sourceType],
+      ['# source_name', r.sourceName || ''],
       ['# duration_seconds', r.durationSeconds],
       ['# sample_rate_hz', r.sampleRateHz],
       ['# fit_min_hz', r.fitRangeHz[0]],
@@ -996,6 +1103,20 @@ footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px;
   els.startBtn.addEventListener('click', startRecording);
   els.stopBtn.addEventListener('click', stopRecording);
   els.clearBtn.addEventListener('click', () => resetMeasurement(true));
+  els.audioFile.addEventListener('change', event => loadAudioFile(event.target.files?.[0]));
+  for (const eventName of ['dragenter', 'dragover']) {
+    els.fileDrop.addEventListener(eventName, event => {
+      event.preventDefault();
+      els.fileDrop.classList.add('dragging');
+    });
+  }
+  for (const eventName of ['dragleave', 'drop']) {
+    els.fileDrop.addEventListener(eventName, event => {
+      event.preventDefault();
+      els.fileDrop.classList.remove('dragging');
+    });
+  }
+  els.fileDrop.addEventListener('drop', event => loadAudioFile(event.dataTransfer?.files?.[0]));
   els.jsonBtn.addEventListener('click', exportJSON);
   els.csvBtn.addEventListener('click', exportCSV);
   els.minFreq.addEventListener('change', handleRangeChange);

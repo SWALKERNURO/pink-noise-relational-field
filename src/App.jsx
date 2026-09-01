@@ -19,42 +19,29 @@ import {
   WaveSine,
   X,
 } from "@phosphor-icons/react";
+import {
+  CONDITION_METRICS,
+  DURATION_SECONDS,
+  TEMPORAL_METRICS,
+  conditionQuality,
+  formatMetricValue,
+  formatSignedMetric,
+  numeric,
+  parseCsv,
+  summarizeTemporalRows,
+} from "./data.js";
 
-const DURATION = 1891;
 const COLORS = {
   eeg: "#c6ff5c",
   horizontal: "#66e8ed",
   vertical: "#a66cff",
   blinks: "#ffc64e",
-  ink: "#f3f5f7",
-  muted: "#7f8798",
 };
 
-const CONDITION_SUMMARY = [
-  { name: "Eyes open", exponent: 0.97, horizontal: 0, vertical: 3, blinks: 6, quality: "Good" },
-  { name: "Eyes closed", exponent: 1.10, horizontal: 25.5, vertical: 6, blinks: 16.5, quality: "Good" },
-  { name: "Video", exponent: 1.61, horizontal: 36, vertical: 15, blinks: 33, quality: "28 strict windows" },
-  { name: "Still image", exponent: 0.97, horizontal: 12, vertical: 4.5, blinks: 36, quality: "Exploratory" },
-  { name: "Nature", exponent: 1.38, horizontal: 36, vertical: 24, blinks: 25.5, quality: "Exploratory" },
-  { name: "Sturm Hall", exponent: 0.76, horizontal: 24, vertical: 6, blinks: 42, quality: "Low EEG fit" },
-];
-
-function parseCsv(text) {
-  const lines = text.trim().split(/\r?\n/);
-  const headers = lines[0].split(",");
-  return lines.slice(1).map((line) => {
-    const cells = line.split(",");
-    return Object.fromEntries(headers.map((header, index) => [header, cells[index] ?? ""]));
-  });
-}
-
-function number(value, fallback = 0) {
-  const parsed = Number(value);
-  return Number.isFinite(parsed) ? parsed : fallback;
-}
+const DATA_BASE = `${import.meta.env.BASE_URL}data`;
 
 function formatTime(seconds) {
-  const safe = Math.max(0, Math.min(DURATION, Math.round(seconds)));
+  const safe = Math.max(0, Math.min(DURATION_SECONDS, Math.round(seconds)));
   return `${String(Math.floor(safe / 60)).padStart(2, "0")}:${String(safe % 60).padStart(2, "0")}`;
 }
 
@@ -63,90 +50,60 @@ function normalize(value, min, max) {
   return Math.max(0, Math.min(1, (value - min) / (max - min)));
 }
 
-function rollingMean(values, radius = 3) {
-  return values.map((_, index) => {
-    const from = Math.max(0, index - radius);
-    const to = Math.min(values.length, index + radius + 1);
-    const window = values.slice(from, to);
-    return window.reduce((sum, value) => sum + value, 0) / window.length;
+function mapRowsToBand(rows, metric) {
+  return rows.flatMap((row) => {
+    const time = numeric(row.midpoint_seconds);
+    const value = numeric(row[metric.key]);
+    if (!Number.isFinite(time) || !Number.isFinite(value)) return [];
+    const plotted = metric.plotBase + normalize(value, ...metric.domain) * metric.plotHeight;
+    return [[time, plotted, value]];
   });
 }
 
-function stagedValue(time, early, middle, end) {
-  const position = Math.max(0, Math.min(1, time / DURATION));
-  if (position <= 0.5) return early + (middle - early) * (position / 0.5);
-  return middle + (end - middle) * ((position - 0.5) / 0.5);
-}
+function getChartOption(rows, blinkEvents, currentTime, markers, showGlow) {
+  const metricSeries = TEMPORAL_METRICS.map((metric) => ({
+    metric,
+    color: COLORS[metric.className],
+    data: mapRowsToBand(rows, metric),
+  }));
 
-function makeParticles(rows, key, center, spread, count = 9) {
-  const points = [];
-  rows.forEach((row, index) => {
-    const value = number(row[key]);
-    for (let i = 0; i < count; i += 1) {
-      const seed = Math.sin((index + 1) * (i + 3) * 12.9898) * 43758.5453;
-      const frac = seed - Math.floor(seed);
-      const timeJitter = ((i / count) - 0.5) * 14;
-      points.push([
-        number(row.midpoint_seconds) + timeJitter,
-        center + (frac - 0.5) * spread + value * 0.0004,
-      ]);
-    }
-  });
-  return points;
-}
+  const glowLines = showGlow
+    ? metricSeries.map(({ data, color }) => ({
+      type: "line",
+      data,
+      showSymbol: false,
+      smooth: 0.24,
+      silent: true,
+      animationDuration: 700,
+      lineStyle: { color, width: 13, opacity: 0.16, shadowBlur: 20, shadowColor: color },
+      z: 2,
+    }))
+    : [];
 
-function getChartOption(rows, blinkEvents, currentTime, markers) {
-  const rawEeg = rows.map((row) => number(row.eeg_exponent, 1.2));
-  const rawH = rows.map((row) => number(row.horizontal_saccades_per_min));
-  const rawV = rows.map((row) => number(row.vertical_saccades_per_min));
-  const rawB = rows.map((row) => number(row.blink_rate_per_min));
-  const times = rows.map((row) => number(row.midpoint_seconds));
+  const measuredPoints = metricSeries.map(({ data, color }) => ({
+    type: "scatter",
+    data,
+    symbolSize: 2.6,
+    itemStyle: { color, opacity: showGlow ? 0.42 : 0.68 },
+    silent: true,
+    z: 4,
+  }));
 
-  const eegMean = rawEeg.reduce((sum, value) => sum + value, 0) / Math.max(1, rawEeg.length);
-  const hMean = rawH.reduce((sum, value) => sum + value, 0) / Math.max(1, rawH.length);
-  const vMean = rawV.reduce((sum, value) => sum + value, 0) / Math.max(1, rawV.length);
-  const bMean = rawB.reduce((sum, value) => sum + value, 0) / Math.max(1, rawB.length);
-
-  const eegValues = rollingMean(rawEeg, 3).map((value, index) => stagedValue(times[index], 1.26, 1.33, 1.63) + (value - eegMean) * 0.24);
-  const hValues = rollingMean(rawH, 3).map((value, index) => stagedValue(times[index], 51, 33, 30) + (value - hMean) * 0.28);
-  const vValues = rollingMean(rawV, 3).map((value, index) => stagedValue(times[index], 21, 18, 9) + (value - vMean) * 0.25);
-  const bValues = rollingMean(rawB, 2).map((value, index) => stagedValue(times[index], 33, 36, 33) + (value - bMean) * 0.2);
-
-  const eeg = times.map((t, i) => [t, 3.38 + normalize(eegValues[i], 0.35, 2.25) * 0.88]);
-  const horizontal = times.map((t, i) => [t, 2.48 + normalize(hValues[i], 0, 120) * 0.48]);
-  const vertical = times.map((t, i) => [t, 1.63 + normalize(vValues[i], 0, 60) * 0.38]);
-  const blinks = times.map((t, i) => [t, 0.77 + normalize(bValues[i], 0, 80) * 0.24]);
-
-  const glowLine = (data, color, width, z) => ({
+  const measuredLines = metricSeries.map(({ metric, data, color }) => ({
+    name: metric.title,
     type: "line",
     data,
     showSymbol: false,
-    smooth: 0.42,
-    silent: true,
-    animationDuration: 900,
-    lineStyle: { color, width, opacity: 0.18, shadowBlur: 22, shadowColor: color },
-    z,
-  });
-
-  const coreLine = (name, data, color, z) => ({
-    name,
-    type: "line",
-    data,
-    showSymbol: false,
-    smooth: 0.42,
-    lineStyle: { color, width: 1.6, opacity: 0.96, shadowBlur: 9, shadowColor: color },
-    emphasis: { lineStyle: { width: 2.4 } },
-    z,
-  });
-
-  const strands = (data, color, amplitude, count = 7) => Array.from({ length: count }, (_, strand) => ({
-    type: "line",
-    data: data.map(([time, value], index) => [time, value + Math.sin(index * 0.55 + strand * 1.7) * amplitude * (0.35 + strand / count)]),
-    showSymbol: false,
-    smooth: 0.48,
-    silent: true,
-    lineStyle: { color, width: 0.8 + (strand % 3) * 0.35, opacity: 0.07 + (strand % 2) * 0.035 },
-    z: 3,
+    smooth: 0.24,
+    lineStyle: {
+      color,
+      width: 1.7,
+      opacity: 0.96,
+      shadowBlur: showGlow ? 8 : 0,
+      shadowColor: color,
+    },
+    emphasis: { lineStyle: { width: 2.5 } },
+    z: 5,
   }));
 
   const markData = [
@@ -155,6 +112,14 @@ function getChartOption(rows, blinkEvents, currentTime, markers) {
     ...markers.map((marker, index) => ({ xAxis: marker, name: `Marker ${index + 1}` })),
     { xAxis: currentTime, name: "" },
   ];
+
+  measuredLines[measuredLines.length - 1].markLine = {
+    silent: true,
+    symbol: ["none", "none"],
+    label: { show: false },
+    lineStyle: { color: "#cbd2dd", type: "dashed", width: 1, opacity: 0.45 },
+    data: markData,
+  };
 
   return {
     animation: true,
@@ -167,23 +132,24 @@ function getChartOption(rows, blinkEvents, currentTime, markers) {
       textStyle: { color: "#f5f7fa", fontFamily: "Inter" },
       axisPointer: { type: "line", lineStyle: { color: "#d6deeb", opacity: 0.35 } },
       formatter: (items) => {
-        const t = items?.[0]?.value?.[0] ?? 0;
-        const nearest = rows.reduce((best, row) =>
-          Math.abs(number(row.midpoint_seconds) - t) < Math.abs(number(best.midpoint_seconds) - t) ? row : best,
-        rows[0]);
+        const time = numeric(items?.[0]?.value?.[0], 0);
+        const nearest = rows.reduce((best, row) => (
+          Math.abs(numeric(row.midpoint_seconds, 0) - time) < Math.abs(numeric(best.midpoint_seconds, 0) - time) ? row : best
+        ), rows[0]);
+        if (!nearest) return `<b>${formatTime(time)}</b>`;
         return [
-          `<b>${formatTime(t)}</b>`,
-          `<span style="color:${COLORS.eeg}">EEG exponent</span> ${number(nearest.eeg_exponent).toFixed(2)}`,
-          `<span style="color:${COLORS.horizontal}">Horizontal</span> ${number(nearest.horizontal_saccades_per_min).toFixed(0)}/min`,
-          `<span style="color:${COLORS.vertical}">Vertical</span> ${number(nearest.vertical_saccades_per_min).toFixed(0)}/min`,
-          `<span style="color:${COLORS.blinks}">Blinks</span> ${number(nearest.blink_rate_per_min).toFixed(0)}/min`,
+          `<b>${formatTime(time)} · measured window</b>`,
+          `<span style="color:${COLORS.eeg}">EEG exponent</span> ${formatMetricValue(numeric(nearest.eeg_exponent), 2)}`,
+          `<span style="color:${COLORS.horizontal}">Horizontal</span> ${formatMetricValue(numeric(nearest.horizontal_saccades_per_min), 1)}/min`,
+          `<span style="color:${COLORS.vertical}">Vertical</span> ${formatMetricValue(numeric(nearest.vertical_saccades_per_min), 1)}/min`,
+          `<span style="color:${COLORS.blinks}">Blinks</span> ${formatMetricValue(numeric(nearest.blink_rate_per_min), 1)}/min`,
         ].join("<br/>");
       },
     },
     xAxis: {
       type: "value",
       min: 0,
-      max: DURATION,
+      max: DURATION_SECONDS,
       position: "top",
       interval: 300,
       axisLine: { lineStyle: { color: "#334052", opacity: 0.9 } },
@@ -198,60 +164,25 @@ function getChartOption(rows, blinkEvents, currentTime, markers) {
     },
     yAxis: { type: "value", min: 0.45, max: 4.55, show: false },
     series: [
-      glowLine(eeg, COLORS.eeg, 18, 2),
-      glowLine(horizontal, COLORS.horizontal, 14, 2),
-      glowLine(vertical, COLORS.vertical, 13, 2),
-      glowLine(blinks, COLORS.blinks, 9, 2),
+      ...glowLines,
+      ...measuredPoints,
+      ...measuredLines,
       {
-        type: "scatter",
-        data: makeParticles(rows, "eeg_exponent", 3.82, 0.72, 11),
-        symbolSize: 1.7,
-        itemStyle: { color: COLORS.eeg, opacity: 0.28 },
-        silent: true,
-        z: 3,
-      },
-      {
-        type: "scatter",
-        data: makeParticles(rows, "horizontal_saccades_per_min", 2.7, 0.43, 7),
-        symbolSize: 1.5,
-        itemStyle: { color: COLORS.horizontal, opacity: 0.25 },
-        silent: true,
-        z: 3,
-      },
-      {
-        type: "scatter",
-        data: makeParticles(rows, "vertical_saccades_per_min", 1.82, 0.35, 7),
-        symbolSize: 1.4,
-        itemStyle: { color: COLORS.vertical, opacity: 0.27 },
-        silent: true,
-        z: 3,
-      },
-      coreLine("Posterior EEG exponent", eeg, COLORS.eeg, 5),
-      coreLine("Horizontal EOG", horizontal, COLORS.horizontal, 5),
-      coreLine("Vertical EOG", vertical, COLORS.vertical, 5),
-      {
-        ...coreLine("Blink candidates", blinks, COLORS.blinks, 5),
-        markLine: {
-          silent: true,
-          symbol: ["none", "none"],
-          label: { show: false },
-          lineStyle: { color: "#cbd2dd", type: "dashed", width: 1, opacity: 0.45 },
-          data: markData,
-        },
-      },
-      ...strands(eeg, COLORS.eeg, 0.08, 9),
-      ...strands(horizontal, COLORS.horizontal, 0.045, 7),
-      ...strands(vertical, COLORS.vertical, 0.04, 7),
-      {
+        name: "Measured blink candidates",
         type: "scatter",
         data: blinkEvents.map((event, index) => [
-          number(event.time_seconds),
+          numeric(event.time_seconds, 0),
           0.88 + Math.sin(index * 2.17) * 0.045,
-          Math.min(60, Math.abs(number(event.vertical_z, 6))),
+          Math.min(60, Math.abs(numeric(event.vertical_z, 6))),
         ]),
         symbol: "rect",
         symbolSize: (value) => [1.1, 5 + Math.min(44, value[2] * 0.7)],
-        itemStyle: { color: COLORS.blinks, opacity: 0.48, shadowBlur: 6, shadowColor: COLORS.blinks },
+        itemStyle: {
+          color: COLORS.blinks,
+          opacity: 0.48,
+          shadowBlur: showGlow ? 6 : 0,
+          shadowColor: COLORS.blinks,
+        },
         silent: true,
         z: 4,
       },
@@ -277,13 +208,31 @@ function ScaleGuide({ top, height, labels }) {
   );
 }
 
-function MetricRow({ title, band, values, delta, finalUncertainty }) {
+function ValueAnnotation({ metric, phase }) {
+  const summary = phase.metrics[metric.key];
   return (
-    <div className="metric-row">
-      <span className="metric-title">{title}</span>
-      <span className="metric-band">{band}</span>
-      <div className="metric-values">{values}</div>
-      <div className="metric-foot"><span>{delta}</span><span>{finalUncertainty}</span></div>
+    <div className={`value-annotation ${metric.className} ${phase.key}`} data-source="movement-windows">
+      <strong>{formatMetricValue(summary.median, metric.decimals)}</strong>
+      <small>IQR {formatMetricValue(summary.q1, metric.decimals)}–{formatMetricValue(summary.q3, metric.decimals)}</small>
+    </div>
+  );
+}
+
+function MetricRow({ metric, phaseSummaries }) {
+  const summaries = phaseSummaries.map((phase) => phase.metrics[metric.key]);
+  const early = summaries[0]?.median;
+  const end = summaries[2]?.median;
+  const final = summaries[2];
+  const values = summaries.map((summary) => formatMetricValue(summary?.median, metric.decimals)).join(" → ");
+  return (
+    <div className="metric-row" data-source="movement-windows">
+      <span className="metric-title">{metric.title}</span>
+      <span className="metric-band">{metric.band} · phase medians</span>
+      <div className="metric-values">{values}{metric.unit}</div>
+      <div className="metric-foot">
+        <span>Δ {formatSignedMetric(end - early, metric.decimals)}{metric.unit}</span>
+        <span>final IQR {formatMetricValue(final?.q1, metric.decimals)}–{formatMetricValue(final?.q3, metric.decimals)}</span>
+      </div>
     </div>
   );
 }
@@ -300,15 +249,23 @@ function SideSection({ number, title, children, open, onToggle, dim = false }) {
   );
 }
 
-const DATA_BASE = `${import.meta.env.BASE_URL}data`;
+async function fetchText(url) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Could not load ${url} (${response.status})`);
+  return response.text();
+}
 
 export function App() {
   const [rows, setRows] = useState([]);
   const [blinkEvents, setBlinkEvents] = useState([]);
+  const [conditions, setConditions] = useState([]);
+  const [selectedCondition, setSelectedCondition] = useState("Video");
   const [playing, setPlaying] = useState(false);
   const [currentTime, setCurrentTime] = useState(648);
   const [speed, setSpeed] = useState(1);
   const [markers, setMarkers] = useState([]);
+  const [showGlow, setShowGlow] = useState(true);
+  const [showValueLabels, setShowValueLabels] = useState(true);
   const [openSections, setOpenSections] = useState({ measured: true, relation: true, question: true });
   const [drawer, setDrawer] = useState(null);
   const [toast, setToast] = useState("");
@@ -316,12 +273,18 @@ export function App() {
 
   useEffect(() => {
     Promise.all([
-      fetch(`${DATA_BASE}/movement_windows.csv`).then((response) => response.text()),
-      fetch(`${DATA_BASE}/eye_movement_candidates.csv`).then((response) => response.text()),
+      fetchText(`${DATA_BASE}/movement_windows.csv`),
+      fetchText(`${DATA_BASE}/eye_movement_candidates.csv`),
+      fetchText(`${DATA_BASE}/condition_eye_movement_summary.csv`),
     ])
-      .then(([windowText, eventText]) => {
-        setRows(parseCsv(windowText).filter((row) => row.condition === "Video"));
-        setBlinkEvents(parseCsv(eventText).filter((event) => event.condition === "Video" && event.event_type === "blink-like"));
+      .then(([windowText, eventText, conditionText]) => {
+        setRows(parseCsv(windowText)
+          .filter((row) => row.condition === "Video")
+          .sort((a, b) => numeric(a.midpoint_seconds, 0) - numeric(b.midpoint_seconds, 0)));
+        setBlinkEvents(parseCsv(eventText)
+          .filter((event) => event.condition === "Video" && event.event_type === "blink-like")
+          .sort((a, b) => numeric(a.time_seconds, 0) - numeric(b.time_seconds, 0)));
+        setConditions(parseCsv(conditionText));
       })
       .catch(() => setToast("The analysis data could not be loaded."));
   }, []);
@@ -330,11 +293,11 @@ export function App() {
     if (!playing) return undefined;
     timerRef.current = window.setInterval(() => {
       setCurrentTime((time) => {
-        if (time >= DURATION) {
+        if (time >= DURATION_SECONDS) {
           setPlaying(false);
-          return DURATION;
+          return DURATION_SECONDS;
         }
-        return Math.min(DURATION, time + speed * 2);
+        return Math.min(DURATION_SECONDS, time + speed * 2);
       });
     }, 200);
     return () => window.clearInterval(timerRef.current);
@@ -346,7 +309,14 @@ export function App() {
     return () => window.clearTimeout(timeout);
   }, [toast]);
 
-  const option = useMemo(() => getChartOption(rows.length ? rows : [{ midpoint_seconds: 0 }], blinkEvents, currentTime, markers), [rows, blinkEvents, currentTime, markers]);
+  const phaseSummaries = useMemo(() => summarizeTemporalRows(rows), [rows]);
+  const option = useMemo(
+    () => getChartOption(rows, blinkEvents, currentTime, markers, showGlow),
+    [rows, blinkEvents, currentTime, markers, showGlow],
+  );
+  const videoCondition = conditions.find((condition) => condition.condition === "Video");
+  const acceptedWindows = numeric(videoCondition?.strict_eeg_accepted_windows, 0);
+  const analysisWindow = numeric(rows[0]?.duration_seconds, 20);
 
   const addMarker = () => {
     const marker = Math.round(currentTime);
@@ -362,17 +332,22 @@ export function App() {
     setToast("Analysis table downloaded");
   };
 
+  const selectCondition = (name) => {
+    setSelectedCondition(name);
+    setToast(`${name} compared with Video`);
+  };
+
   return (
-    <main className="app-shell">
+    <main className="app-shell" data-glow={showGlow} data-value-labels={showValueLabels}>
       <nav className="tool-rail" aria-label="Primary tools">
         <WaveSine size={29} weight="regular" className="brand-mark" />
         <div className="tool-group">
-          <button className="rail-button active" aria-label="Playback view" onClick={() => setDrawer(null)}><Play size={22} weight="fill" /></button>
-          <button className="rail-button" aria-label="Compare conditions" onClick={() => setDrawer("conditions")}><ChartLine size={23} /></button>
-          <button className="rail-button" aria-label="About this analysis" onClick={() => setDrawer("about")}><Info size={23} /></button>
+          <button className={`rail-button ${drawer === null ? "active" : ""}`} aria-label="Playback view" onClick={() => setDrawer(null)}><Play size={22} weight="fill" /></button>
+          <button className={`rail-button ${drawer === "conditions" ? "active" : ""}`} aria-label="Compare conditions" onClick={() => setDrawer("conditions")}><ChartLine size={23} /></button>
+          <button className={`rail-button ${drawer === "about" ? "active" : ""}`} aria-label="About this analysis" onClick={() => setDrawer("about")}><Info size={23} /></button>
           <button className="rail-button" aria-label="Download data" onClick={exportCsv}><DownloadSimple size={23} /></button>
-          <button className="rail-button" aria-label="Display controls" onClick={() => setDrawer("settings")}><SlidersHorizontal size={23} /></button>
-          <button className="rail-button" aria-label="Help" onClick={() => setDrawer("help")}><Question size={23} /></button>
+          <button className={`rail-button ${drawer === "settings" ? "active" : ""}`} aria-label="Display controls" onClick={() => setDrawer("settings")}><SlidersHorizontal size={23} /></button>
+          <button className={`rail-button ${drawer === "help" ? "active" : ""}`} aria-label="Help" onClick={() => setDrawer("help")}><Question size={23} /></button>
         </div>
         <div className="live-card"><span><i /> LIVE</span><small>offline<br />data</small></div>
       </nav>
@@ -383,7 +358,7 @@ export function App() {
             <h1>Pink noise, 1/f structure, and eye movement</h1>
             <p>One video recording. Multiple signals. Different trajectories.</p>
             <div className="recording-meta">
-              <span><i /> 31:31 recording</span><b>•</b><span>28 of 94 strict windows accepted</span><b>•</b><span>96.7% signal continuity</span>
+              <span><i /> 31:31 recording</span><b>•</b><span>{acceptedWindows} of {rows.length || 94} strict windows accepted</span><b>•</b><span>{analysisWindow} s measured windows</span>
             </div>
           </div>
           <button className="caution" onClick={() => setDrawer("about")}>Different trajectories, not proof of causation. <Info size={13} /></button>
@@ -399,22 +374,13 @@ export function App() {
           <SignalLabel top="62%" title="Vertical eye movement" detail="0.5–15 Hz" metric="candidates / min" color={COLORS.vertical} />
           <SignalLabel top="84%" title="Blinks" detail="candidate events" metric="candidates / min" color={COLORS.blinks} />
           <ScaleGuide top="10%" height="22%" labels={["2.0", "1.5", "1.0", "0.5", "0"]} />
-          <ScaleGuide top="40%" height="14%" labels={["120", "80", "40", "0"]} />
+          <ScaleGuide top="40%" height="14%" labels={["150", "100", "50", "0"]} />
           <ScaleGuide top="63%" height="12%" labels={["60", "40", "20", "0"]} />
           <ScaleGuide top="84%" height="10%" labels={["80", "40", "0"]} />
           <ReactECharts option={option} className="field-chart" notMerge lazyUpdate opts={{ renderer: "canvas" }} />
-          <div className="value-annotation eeg early"><strong>1.26</strong><small>±0.12</small></div>
-          <div className="value-annotation eeg mid"><strong>1.33</strong><small>±0.10</small></div>
-          <div className="value-annotation eeg end"><strong>1.63</strong><small>±0.11</small></div>
-          <div className="value-annotation horizontal early"><strong>51</strong><small>±9</small></div>
-          <div className="value-annotation horizontal mid"><strong>33</strong><small>±6</small></div>
-          <div className="value-annotation horizontal end"><strong>30</strong><small>±5</small></div>
-          <div className="value-annotation vertical early"><strong>21</strong><small>±5</small></div>
-          <div className="value-annotation vertical mid"><strong>18</strong><small>±4</small></div>
-          <div className="value-annotation vertical end"><strong>9</strong><small>±3</small></div>
-          <div className="value-annotation blinks early"><strong>33</strong><small>±8</small></div>
-          <div className="value-annotation blinks mid"><strong>36</strong><small>±9</small></div>
-          <div className="value-annotation blinks end"><strong>33</strong><small>±8</small></div>
+          {showValueLabels && rows.length > 0 && TEMPORAL_METRICS.flatMap((metric) => (
+            phaseSummaries.map((phase) => <ValueAnnotation key={`${metric.key}-${phase.key}`} metric={metric} phase={phase} />)
+          ))}
         </div>
 
         <footer className="playback">
@@ -427,10 +393,10 @@ export function App() {
               aria-label="Recording time"
               type="range"
               min="0"
-              max={DURATION}
+              max={DURATION_SECONDS}
               value={currentTime}
-              onChange={(event) => setCurrentTime(number(event.target.value))}
-              style={{ "--progress": `${(currentTime / DURATION) * 100}%` }}
+              onChange={(event) => setCurrentTime(numeric(event.target.value, 0))}
+              style={{ "--progress": `${(currentTime / DURATION_SECONDS) * 100}%` }}
             />
             <div className="timeline-times"><span>{formatTime(currentTime)}</span><span>31:31</span></div>
             <div className="legend">
@@ -441,7 +407,7 @@ export function App() {
             </div>
           </div>
           <label className="speed-control">
-            <select value={speed} onChange={(event) => setSpeed(number(event.target.value, 1))} aria-label="Playback speed">
+            <select value={speed} onChange={(event) => setSpeed(numeric(event.target.value, 1))} aria-label="Playback speed">
               <option value="0.5">0.5×</option><option value="1">1×</option><option value="2">2×</option>
             </select>
             <CaretDown size={13} />
@@ -452,14 +418,11 @@ export function App() {
 
       <aside className="analysis-rail">
         <SideSection number="01" title="Measured" open={openSections.measured} onToggle={() => setOpenSections((state) => ({ ...state, measured: !state.measured }))}>
-          <p className="section-kicker">Change across recording</p>
-          <MetricRow title="Posterior EEG exponent" band="2–40 Hz" values="1.26 → 1.33 → 1.63" delta="Δ +0.37 (early → end)" finalUncertainty="±0.11 final" />
-          <MetricRow title="Horizontal eye movement" band="0.5–15 Hz" values="51 → 33 → 30 /min" delta="Δ −21 /min" finalUncertainty="±5 final" />
-          <MetricRow title="Vertical eye movement" band="0.5–15 Hz" values="21 → 18 → 9 /min" delta="Δ −12 /min" finalUncertainty="±3 final" />
-          <MetricRow title="Blinks" band="candidate events" values="33 → 36 → 33 /min" delta="Δ 0 /min" finalUncertainty="±8 final" />
+          <p className="section-kicker">Measured phase medians · IQR</p>
+          {TEMPORAL_METRICS.map((metric) => <MetricRow key={metric.key} metric={metric} phaseSummaries={phaseSummaries} />)}
         </SideSection>
         <SideSection number="02" title="Relation" open={openSections.relation} onToggle={() => setOpenSections((state) => ({ ...state, relation: !state.relation }))}>
-          <p className="relation-copy">As posterior EEG exponent steepens (flatter → steeper 1/f structure), eye-movement rates decline and stabilize, while blink rate continues independently.</p>
+          <p className="relation-copy">Across measured phase medians, posterior EEG exponent steepens while horizontal and vertical candidate rates decline; blink rates vary on a separate trajectory.</p>
           <p className="caveat-copy">After removing the shared passage of time, direct EEG–eye coupling was weak. The trajectories coexist; they do not establish causation.</p>
         </SideSection>
         <SideSection number="03" title="Question" dim open={openSections.question} onToggle={() => setOpenSections((state) => ({ ...state, question: !state.question }))}>
@@ -474,9 +437,16 @@ export function App() {
         <div className="drawer-backdrop" onMouseDown={() => setDrawer(null)}>
           <aside className="drawer" onMouseDown={(event) => event.stopPropagation()}>
             <button className="drawer-close" onClick={() => setDrawer(null)} aria-label="Close panel"><X size={20} /></button>
-            {drawer === "conditions" && <ConditionDrawer onSelect={(name) => { setToast(`${name} comparison selected`); setDrawer(null); }} />}
+            {drawer === "conditions" && <ConditionDrawer conditions={conditions} selectedName={selectedCondition} onSelect={selectCondition} />}
             {drawer === "about" && <AboutDrawer />}
-            {drawer === "settings" && <SettingsDrawer />}
+            {drawer === "settings" && (
+              <SettingsDrawer
+                showGlow={showGlow}
+                showValueLabels={showValueLabels}
+                onGlowChange={setShowGlow}
+                onValueLabelsChange={setShowValueLabels}
+              />
+            )}
             {drawer === "help" && <HelpDrawer />}
             {drawer === "notes" && <NotesDrawer />}
           </aside>
@@ -487,21 +457,50 @@ export function App() {
   );
 }
 
-function ConditionDrawer({ onSelect }) {
+function ConditionDrawer({ conditions, selectedName, onSelect }) {
+  const video = conditions.find((condition) => condition.condition === "Video");
+  const selected = conditions.find((condition) => condition.condition === selectedName) ?? video;
   return <>
     <span className="drawer-eyebrow">Compare conditions</span>
-    <h2>Six contexts, one pilot recording set</h2>
-    <p className="drawer-lede">Use the video as the temporal case, then compare its summary against baseline, still image, nature, and Sturm Hall.</p>
-    <div className="condition-list">
-      {CONDITION_SUMMARY.map((condition) => (
-        <button key={condition.name} className={condition.name === "Video" ? "selected" : ""} onClick={() => onSelect(condition.name)}>
-          <span><Eye size={19} /><b>{condition.name}</b><small>{condition.quality}</small></span>
-          <strong>{condition.exponent.toFixed(2)}</strong>
-          <em>EEG exponent</em>
-          <CaretRight size={14} />
-        </button>
-      ))}
+    <h2>Six measured contexts</h2>
+    <p className="drawer-lede">Select a condition to compare its measured medians and condition-level EEG fit with the Video reference.</p>
+    <div className="condition-list" aria-label="Condition summaries">
+      {conditions.length === 0 && <p className="drawer-empty">Loading condition summary…</p>}
+      {conditions.map((condition) => {
+        const name = condition.condition;
+        const selectedState = name === selected?.condition;
+        return (
+          <button key={name} className={selectedState ? "selected" : ""} aria-pressed={selectedState} onClick={() => onSelect(name)}>
+            <span><Eye size={19} /><b>{name}</b><small>{conditionQuality(condition)}</small></span>
+            <strong>{formatMetricValue(numeric(condition.eeg_exponent_condition_fit), 2)}</strong>
+            <em>EEG exponent</em>
+            <CaretRight size={14} />
+          </button>
+        );
+      })}
     </div>
+    {selected && video && (
+      <section className="condition-comparison" aria-live="polite" data-source="condition-eye-movement-summary">
+        <div className="condition-comparison-heading">
+          <span>{selected.condition === "Video" ? "Temporal reference" : `${selected.condition} vs Video`}</span>
+          <small>{conditionQuality(selected)}</small>
+        </div>
+        <div className="comparison-grid">
+          {CONDITION_METRICS.map((metric) => {
+            const value = numeric(selected[metric.key]);
+            const videoValue = numeric(video[metric.key]);
+            const delta = value - videoValue;
+            return (
+              <div className="comparison-metric" key={metric.key}>
+                <span>{metric.label}</span>
+                <strong>{formatMetricValue(value, metric.decimals)} <small>{metric.unit}</small></strong>
+                <em>{selected.condition === "Video" ? "Video baseline" : `${formatSignedMetric(delta, metric.decimals)} ${metric.unit} vs Video`}</em>
+              </div>
+            );
+          })}
+        </div>
+      </section>
+    )}
   </>;
 }
 
@@ -509,29 +508,27 @@ function AboutDrawer() {
   return <>
     <span className="drawer-eyebrow">How to read this</span>
     <h2>A field of measured changes</h2>
-    <p className="drawer-lede">The visual treats the recording as a moving field: posterior EEG structure and ocular activity unfold together, but remain analytically distinct.</p>
+    <p className="drawer-lede">Each temporal line passes through values from the 20-second Video windows in movement_windows.csv. The labels summarize those same rows with phase medians and interquartile ranges.</p>
     <div className="plain-card"><Pulse size={22} color={COLORS.eeg} /><div><b>1/f exponent</b><p>A steeper exponent means relatively less high-frequency power. It is a property of the spectrum, not consciousness itself.</p></div></div>
     <div className="plain-card"><Eye size={22} color={COLORS.horizontal} /><div><b>Eye movement</b><p>Horizontal and vertical candidate rates describe movement in the EOG channels. Polarity was not calibrated, so anatomical direction is not claimed.</p></div></div>
     <div className="plain-card"><Info size={22} color={COLORS.blinks} /><div><b>Pilot limits</b><p>One participant, fixed condition order, no gaze-video ground truth, and a vertical EOG channel that also contains blinks.</p></div></div>
   </>;
 }
 
-function SettingsDrawer() {
-  const [glow, setGlow] = useState(true);
-  const [labels, setLabels] = useState(true);
+function SettingsDrawer({ showGlow, showValueLabels, onGlowChange, onValueLabelsChange }) {
   return <>
     <span className="drawer-eyebrow">Display controls</span><h2>Shape the view</h2>
-    <p className="drawer-lede">These controls change presentation only; they do not alter the analysis.</p>
-    <label className="toggle-row"><span><b>Signal glow</b><small>Emphasize trajectory density</small></span><input type="checkbox" checked={glow} onChange={() => setGlow(!glow)} /></label>
-    <label className="toggle-row"><span><b>Value labels</b><small>Show early, middle, and end summaries</small></span><input type="checkbox" checked={labels} onChange={() => setLabels(!labels)} /></label>
+    <p className="drawer-lede">These controls change presentation only; they do not alter the measured values or summaries.</p>
+    <label className="toggle-row"><span><b>Signal glow</b><small>Emphasize measured trajectory density</small></span><input aria-label="Signal glow" type="checkbox" checked={showGlow} onChange={(event) => onGlowChange(event.target.checked)} /></label>
+    <label className="toggle-row"><span><b>Value labels</b><small>Show phase medians and IQRs</small></span><input aria-label="Value labels" type="checkbox" checked={showValueLabels} onChange={(event) => onValueLabelsChange(event.target.checked)} /></label>
     <div className="plain-card"><GearSix size={22} /><div><b>Scientific defaults are locked</b><p>Welch PSD, 2–40 Hz EEG exponent, 0.5–15 Hz EOG filtering, and validated candidate thresholds remain unchanged.</p></div></div>
   </>;
 }
 
 function HelpDrawer() {
-  return <><span className="drawer-eyebrow">Quick guide</span><h2>Read from top to bottom</h2><ol className="help-list"><li><b>EEG:</b> how the aperiodic spectrum changes.</li><li><b>Horizontal EOG:</b> lateral movement candidates.</li><li><b>Vertical EOG:</b> vertical movement candidates, excluding blink neighborhoods.</li><li><b>Blinks:</b> adaptive candidate events.</li><li><b>Measured → Relation → Question:</b> evidence first, interpretation second, inquiry third.</li></ol></>;
+  return <><span className="drawer-eyebrow">Quick guide</span><h2>Read from top to bottom</h2><ol className="help-list"><li><b>EEG:</b> measured aperiodic exponent in each Video window.</li><li><b>Horizontal EOG:</b> lateral candidate rate per measured window.</li><li><b>Vertical EOG:</b> vertical candidate rate, excluding blink neighborhoods.</li><li><b>Blinks:</b> window rate plus individual adaptive candidate events.</li><li><b>Measured → Relation → Question:</b> evidence first, interpretation second, inquiry third.</li></ol></>;
 }
 
 function NotesDrawer() {
-  return <><span className="drawer-eyebrow">Analysis notes</span><h2>What the video result can—and cannot—say</h2><p className="drawer-lede">Across the video, posterior EEG exponent increased while horizontal and vertical eye-movement candidate rates declined. Blink rate remained broadly stable.</p><div className="note-block"><b>Most important caution</b><p>The raw horizontal EOG–EEG correlation was negative, but became weak after removing their shared time trends. The app therefore presents parallel trajectories, not a mechanism.</p></div><div className="note-block"><b>Nail-informed reading</b><p>The useful philosophical move is relational: ask how heterogeneous processes compose a field over time. The visualization does not identify pink noise with consciousness.</p></div></>;
+  return <><span className="drawer-eyebrow">Analysis notes</span><h2>What the video result can—and cannot—say</h2><p className="drawer-lede">Measured phase medians show a higher posterior EEG exponent late in the video and lower horizontal and vertical candidate rates. Blink rate does not follow the same change.</p><div className="note-block"><b>Most important caution</b><p>The raw horizontal EOG–EEG correlation was negative, but became weak after removing their shared time trends. The app therefore presents parallel trajectories, not a mechanism.</p></div><div className="note-block"><b>Nail-informed reading</b><p>The useful philosophical move is relational: ask how heterogeneous processes compose a field over time. The visualization does not identify pink noise with consciousness.</p></div></>;
 }

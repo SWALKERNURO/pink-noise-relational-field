@@ -1,24 +1,106 @@
 # Pink Noise Relational Field
 
-Interactive React/Vite visualization exploring pink-noise / 1/f EEG structure alongside eye-movement measures from one recording.
+An interactive scientific visualization of posterior EEG 1/f structure, eye-movement candidates, and blink candidates from a 31:31 video recording. The interface keeps measured results, interpretation, and open questions visibly separate.
+
+![Pink Noise Relational Field interface](docs/design/implementation-measured-final.png)
+
+## What is included
+
+- A full-screen temporal field with four stacked measured trajectories: posterior EEG exponent, horizontal EOG candidates, vertical EOG candidates, and blink rate.
+- Early, middle, and end annotations calculated at runtime as medians and interquartile ranges from the Video rows in [`movement_windows.csv`](public/data/movement_windows.csv).
+- A condition comparison panel populated from [`condition_eye_movement_summary.csv`](public/data/condition_eye_movement_summary.csv), with every condition compared against the Video reference.
+- Functional playback, timeline scrubbing, playback speed, markers, section toggles, CSV download, glow control, and value-label control.
+- A standalone [NoiseColor](public/noisecolor/index.html) spectral analyzer at `/noisecolor/` that can record microphone input or decode a local audio file with picker and drag-and-drop input.
+- GitHub Pages and OpenAI Sites-compatible production output.
+
+## Data integrity
+
+The temporal chart does not use a staged or hand-authored trend. Each line passes through the corresponding measured value from a 20-second Video window. The visual stacking applies only a fixed affine display mapping so signals with different units can share the field; it does not change the source values shown in tooltips or summaries.
+
+Phase summaries use these recording-time partitions:
+
+| Phase | Video midpoint range | Windows |
+| --- | --- | ---: |
+| Early | 0:00–9:59 | 30 |
+| Middle | 10:00–19:59 | 30 |
+| End | 20:00–31:31 | 34 |
+
+The condition panel uses condition-level EEG fits and median EOG/blink rates directly from `condition_eye_movement_summary.csv`.
+
+## Scientific scope and cautions
+
+This is an exploratory pilot visualization, not a diagnostic tool. The dataset represents one participant with fixed condition order. EOG polarity was not calibrated, gaze-video ground truth was unavailable, and the vertical EOG channel also contains blinks. Candidate events come from an adaptive detector rather than manually validated eye tracking.
+
+A changing EEG exponent and changing eye-movement rates can coexist without establishing a causal mechanism. The interface therefore labels the data as measured, keeps relational language interpretive, and presents unanswered questions separately.
+
+## NoiseColor audio input
+
+NoiseColor estimates the spectral exponent β in `P(f) ∝ 1/f^β` with Welch power spectral density and a log-log power-law fit. It supports:
+
+- live microphone capture over HTTPS or localhost;
+- local WAV, MP3, M4A, AAC, OGG, and FLAC files supported by the browser;
+- mono mixing for multichannel files;
+- files up to 100 MB, retaining the final 120 seconds for analysis;
+- selectable fit range and analysis window;
+- JSON and CSV export with source type and file name provenance.
+
+Microphones and browser audio processing are not calibrated acoustic measurement chains. Use NoiseColor for exploratory or relative spectral analysis, not sound-pressure-level measurement.
 
 ## Local development
 
+Requirements: Node.js 20 or newer and npm.
+
 ```bash
-npm install
+npm ci
 npm run dev
 ```
 
-## Production build
+Vite serves the relational field at `/` and NoiseColor at `/noisecolor/index.html`; static production hosts also resolve `/noisecolor/`.
+
+## Tests and production build
+
+Run the complete verification suite:
 
 ```bash
-npm run build
+npm run verify
 ```
 
-The static client build is written to `dist/client`.
+The suite validates CSV parsing and measured phase summaries, condition-summary wiring, NoiseColor file upload, repository hygiene, the production client build, the server worker fallback, and Sites packaging.
 
-## GitHub Pages
+Individual commands:
 
-This repository includes a GitHub Actions workflow at `.github/workflows/deploy-pages.yml` that builds the app and deploys `dist/client` to GitHub Pages on pushes to `main`.
+```bash
+npm test
+npm run build
+npm run test:sites
+```
 
-The Vite base path is derived automatically from `GITHUB_REPOSITORY` during GitHub Actions builds, so bundled assets and files under `public/data` resolve correctly at `https://<username>.github.io/<repo>/`, even if the repository is renamed.
+`npm run build` writes the Vite client to `dist/client` and prepares:
+
+- `dist/client/index.html`
+- `dist/server/index.js`
+- `dist/.openai/hosting.json`
+
+## Deployment
+
+The workflow in [`.github/workflows/deploy-pages.yml`](.github/workflows/deploy-pages.yml) builds and deploys `dist/client` to GitHub Pages after pushes to `main`. Vite derives the repository base path from `GITHUB_REPOSITORY` in GitHub Actions, so assets and data files resolve under the Pages project path.
+
+The worker and hosting manifest also allow the same verified build to be handed to OpenAI Sites without changing the application runtime.
+
+## Repository map
+
+```text
+src/                    React interface and measured-data utilities
+public/data/            Validated pilot analysis tables and summary metadata
+public/noisecolor/      Standalone microphone/file spectral analyzer
+docs/design/            Selected visual target and design-QA screenshots
+tests/                  Data, repository, and Sites worker tests
+worker/                 Static asset worker with app-shell fallback
+scripts/                Sites build preparation
+```
+
+The selected design reference and comparison evidence are documented in [`docs/design`](docs/design) and [`design-qa.md`](design-qa.md).
+
+## License
+
+Released under the [MIT License](LICENSE).

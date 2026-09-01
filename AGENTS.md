@@ -8,7 +8,7 @@ When implementing from a selected generated mock, treat that image as the source
 
 ## Selected product direction
 
-- The selected visual target is `reference-selected.png`: a dark, full-screen temporal field with four vertically stacked signal trajectories, a narrow left tool rail, persistent playback controls, and a measured/relation/question interpretation rail.
+- The selected visual target is `docs/design/reference-selected.png`: a dark, full-screen temporal field with four vertically stacked signal trajectories, a narrow left tool rail, persistent playback controls, and a measured/relation/question interpretation rail.
 - Keep scientific claims cautious and legible. Always distinguish measured results from interpretation and open questions.
 - The default state focuses on the 31:31 video recording and uses the validated EEG/EOG pilot analysis in `public/data/`.
 
