@@ -13,3 +13,29 @@ When implementing from a selected generated mock, treat that image as the source
 - The default state focuses on the 31:31 video recording and uses the validated EEG/EOG pilot analysis in `public/data/`.
 
 Build app UI in `src/`. Keep `.openai/hosting.json`, `worker/index.js`, `scripts/prepare-sites-build.mjs`, and `tests/sites-worker.test.mjs` intact so the same local prototype can be handed to Sites. Before a Sites handoff, run `npm run build` and `npm run test:sites`; the build must leave `dist/client/index.html`, `dist/server/index.js`, and `dist/.openai/hosting.json`.
+## NoiseColor
+
+NoiseColor is the mobile-first acoustic spectral-analysis application under:
+
+public/noisecolor/
+
+Rules:
+
+- NoiseColor is independent of the Pink Noise Relational Field React visualization.
+- Do not materially modify src/App.jsx or the main relational-field application unless explicitly requested.
+- Repository-level README, tests, package scripts, and deployment files may be changed when required for NoiseColor.
+- Preserve:
+  https://swalkernuro.github.io/pink-noise-relational-field/
+- Preserve:
+  https://swalkernuro.github.io/pink-noise-relational-field/noisecolor/
+
+Scientific requirements:
+
+- Estimate β from the unweighted continuous PSD.
+- Do not estimate β from A-weighted or third-octave values.
+- Do not force tonal, silent, unstable, or poorly fit signals into canonical noise colors.
+- Preserve raw β separately from smoothed/display β.
+- Audio processing must remain local to the user's device.
+- Do not persist raw microphone audio unless explicitly requested.
+- NoiseCapture may be used only as conceptual inspiration; do not copy GPLv3 source.
+- Run scientific validation, tests, production build, and browser QA before committing.
