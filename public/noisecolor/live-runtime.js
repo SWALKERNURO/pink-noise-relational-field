@@ -7,6 +7,40 @@ export const MODE_CONFIG = Object.freeze({
   stable: Object.freeze({ fastSeconds: 3, stableSeconds: 12, fastEveryMs: 750, stableEveryMs: 1500 }),
 });
 
+// One dispatcher owns the worker. Independent 500/1000 ms timers let the fast
+// callback win every collision and indefinitely starve stable observations.
+export class LiveAnalysisScheduler {
+  constructor(config) {
+    this.config = config;
+    this.lastFast = -Infinity;
+    this.lastStable = -Infinity;
+  }
+
+  next(nowMs, availableSeconds, busy = false) {
+    if (busy) return null; // A skipped deadline remains due.
+    if (availableSeconds >= this.config.stableSeconds && nowMs - this.lastStable >= this.config.stableEveryMs) {
+      this.lastStable = nowMs;
+      return "stable";
+    }
+    if (availableSeconds >= Math.min(1.5, this.config.fastSeconds) && nowMs - this.lastFast >= this.config.fastEveryMs) {
+      this.lastFast = nowMs;
+      return "fast";
+    }
+    return null;
+  }
+}
+
+export function sessionSignalPercentages(percentages = {}) {
+  return { lowSignal: percentages.silence || 0, awaitingAnalysis: percentages.insufficient || 0 };
+}
+
+export function capturePcm(samples, { rolling, sessionAccumulator, recordingBuffer, trace, fallback }) {
+  trace.record("captureSamples", samples);
+  rolling.push(samples);
+  sessionAccumulator.addAudio(samples, fallback);
+  recordingBuffer?.push(samples);
+}
+
 export class RollingBuffer {
   constructor(capacity) {
     if (!Number.isInteger(capacity) || capacity <= 0) throw new RangeError("Rolling-buffer capacity must be a positive integer.");
