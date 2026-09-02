@@ -7,13 +7,14 @@ import {
   WELCH_OVERLAP,
   SessionAccumulator,
   summarize,
-} from "./analysis-engine.js?v=0.6.8";
-import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.8";
-import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.8";
-import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.8";
-import { MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow } from "./live-runtime.js?v=0.6.8";
-import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.8";
-import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.8";
+} from "./analysis-engine.js?v=0.6.8-diagnostic.1";
+import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.8-diagnostic.1";
+import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.8-diagnostic.1";
+import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.8-diagnostic.1";
+import { capturePcm, LiveAnalysisScheduler, MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow, sessionSignalPercentages } from "./live-runtime.js?v=0.6.8-diagnostic.1";
+import { PcmTrace, PcmMeter } from "./pcm-diagnostics.js?v=0.6.8-diagnostic.1";
+import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.8-diagnostic.1";
+import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.8-diagnostic.1";
 
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 32 * 1024 * 1024;
@@ -45,6 +46,10 @@ const state = {
   captureNode: null,
   silentGain: null,
   rolling: null,
+  recordingPcm: null,
+  pcmTrace: null,
+  captureInputPcm: null,
+  captureTransport: null,
   listening: false,
   recording: false,
   sampleRate: null,
@@ -117,7 +122,7 @@ function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) 
     calibrationProfile: profile,
     temporalSd: sourceType === "live" ? summarize(state.observations.slice(-10).filter((item) => item.reliable).map((item) => item.beta)).sd || 0 : 0,
     previousProminentPeakFrequencies: sourceType === "live" ? state.latestResult?.prominentPeakFrequencies || [] : [],
-    maxWelchSegments: sourceType === "live" ? 48 : 96,
+    maxWelchSegments: 48,
     scalarGainDb: Number(elements.scalarGain.value) || 0,
     calibrationRouteKey: state.inputRoute,
     inputRouteLabel: state.inputRouteLabel,
@@ -128,7 +133,7 @@ function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) 
 
 function ensureWorker() {
   if (state.worker) return state.worker;
-  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.8", import.meta.url), { type: "module" });
+  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.8-diagnostic.1", import.meta.url), { type: "module" });
   state.worker.addEventListener("message", (event) => {
     const request = state.workerRequests.get(event.data.id);
     if (!request) return;
@@ -149,6 +154,10 @@ function requestAnalysis(type, samples, sampleRate, options = {}) {
   if (state.workerBusy) return Promise.reject(new Error("Analysis is busy; the superseded request was dropped."));
   const worker = ensureWorker();
   const id = ++state.workerId;
+  if (type === "analyze-live" || type === "analyze-fast" || options.sourceType === "recorded-microphone") {
+    state.pcmTrace?.record(options.sourceType === "recorded-microphone" ? "recordingBuffer" : "rollingBuffer", samples);
+    options = { ...options, pcmDiagnostics: { ...captureDiagnostics(), ...options.pcmDiagnostics } };
+  }
   state.workerBusy = true;
   return new Promise((resolve, reject) => {
     state.workerRequests.set(id, { resolve, reject });
@@ -160,6 +169,14 @@ function requestAnalysis(type, samples, sampleRate, options = {}) {
       reject(error);
     }
   });
+}
+
+function captureDiagnostics() {
+  return { ...state.pcmTrace?.snapshot(), captureInput: state.captureInputPcm,
+    sessionAccumulator: state.sessionAccumulator?.inputMeter.snapshot(),
+    activityTimeline: state.sessionAccumulator?.activityMeter.snapshot(),
+    lastActivityFrame: state.sessionAccumulator?.lastActivityPcm,
+    source: { transport: state.captureTransport, observationBoundary: "Web Audio input from getUserMedia; no pre-browser PCM access", sampleRate: state.sampleRate, settings: sanitizeMicrophoneSettings(state.constraintSettings) } };
 }
 
 function cancelPendingAnalysis() {
@@ -223,6 +240,7 @@ function clearResultContainer(container) {
 }
 
 function releaseRecordingObject() {
+  state.recordingPcm = null;
   if (state.recordingUrl) URL.revokeObjectURL(state.recordingUrl);
   state.recordingUrl = null;
   state.recordingBlob = null;
@@ -405,9 +423,11 @@ async function startMicrophone({ recording = false } = {}) {
       const sessionAccumulator = new SessionAccumulator(audioContext.sampleRate);
       const captureSamples = (samples) => {
         if (!state.listening) return;
-        rolling.push(samples);
-        sessionAccumulator.addAudio(samples, state.liveDisplay);
+        capturePcm(samples, { rolling, sessionAccumulator, recordingBuffer: state.recordingPcm, trace: state.pcmTrace, fallback: state.liveDisplay });
       };
+      state.pcmTrace = new PcmTrace();
+      state.captureInputPcm = null;
+      state.recordingPcm = recording ? new RollingBuffer(audioContext.sampleRate * MAX_RECORDING_SECONDS) : null;
       const sourceNode = audioContext.createMediaStreamSource(stream);
       await startup.track(sourceNode, disconnectAudioNode);
       const silentGain = audioContext.createGain();
@@ -417,13 +437,25 @@ async function startMicrophone({ recording = false } = {}) {
 
       let captureNode;
       if (audioContext.audioWorklet) {
-        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.8");
+        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.8-diagnostic.1");
         startup.checkpoint();
-        captureNode = new AudioWorkletNode(audioContext, "noisecolor-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
-        captureNode.port.onmessage = (event) => captureSamples(event.data);
+        captureNode = new AudioWorkletNode(audioContext, "noisecolor-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 1, channelCountMode: "explicit", channelInterpretation: "speakers" });
+        state.captureTransport = "AudioWorklet / explicit mono input";
+        captureNode.port.onmessage = (event) => {
+          state.captureInputPcm = event.data.input;
+          if (state.listening) state.pcmTrace.record("workletOutput", event.data.samples);
+          captureSamples(event.data.samples);
+        };
       } else {
         captureNode = audioContext.createScriptProcessor(2048, 1, 1);
-        captureNode.onaudioprocess = (event) => captureSamples(new Float32Array(event.inputBuffer.getChannelData(0)));
+        state.captureTransport = "ScriptProcessor / mono input";
+        const inputMeter = new PcmMeter();
+        captureNode.onaudioprocess = (event) => {
+          const samples = new Float32Array(event.inputBuffer.getChannelData(0));
+          state.captureInputPcm = inputMeter.add(samples);
+          if (state.listening) state.pcmTrace.record("scriptProcessorOutput", samples);
+          captureSamples(samples);
+        };
       }
       await startup.track(captureNode, disconnectAudioNode);
       sourceNode.connect(captureNode);
@@ -508,8 +540,13 @@ function constraintSummary() {
 function startSchedulers() {
   const config = modeConfig();
   stopSchedulers();
-  state.fastTimer = window.setInterval(runFastAnalysis, config.fastEveryMs);
-  state.stableTimer = window.setInterval(runStableAnalysis, config.stableEveryMs);
+  const scheduler = new LiveAnalysisScheduler(config);
+  state.fastTimer = window.setInterval(() => {
+    if (!state.listening || !state.rolling) return;
+    const task = scheduler.next(performance.now(), state.rolling.length / state.sampleRate, state.workerBusy);
+    if (task === "stable") void runStableAnalysis();
+    else if (task === "fast") void runFastAnalysis();
+  }, Math.min(100, config.fastEveryMs));
   state.spectrogramTimer = window.setInterval(runSpectrogram, 7000);
 }
 
@@ -563,7 +600,7 @@ async function runStableAnalysis() {
     state.latestResult = result;
     const display = stateMachine.update(result);
     displayLiveState(display, result);
-    state.sessionAccumulator?.addObservation({ ...observation, beta: display.displayBeta, state: display.state, classification: display.label, reliable: display.reliable });
+    state.sessionAccumulator?.addObservation({ ...observation, state: display.state, classification: display.label, reliable: display.reliable });
     const stableValues = state.observations.slice(-10).filter((item) => item.reliable).map((item) => item.beta);
     const stableSummary = summarize(stableValues);
     elements.stability.textContent = Number.isFinite(stableSummary.sd) ? `±${stableSummary.sd.toFixed(2)}` : "—";
@@ -611,6 +648,7 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
     const sessionReliable = Boolean(session.dominantReliableColor) && session.rejectedPercentage < 20;
     state.lastSummary = {
       ...session,
+      pcmDiagnostics: { ...captureDiagnostics(), ...session.pcmDiagnostics, workerInput: state.latestResult?.pcmDiagnostics?.workerInput },
       id: undefined,
       appVersion: APP_VERSION,
       analysisEngineVersion: ENGINE_VERSION,
@@ -660,6 +698,7 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
     state.silentGain = null;
     state.rolling = null;
     state.sessionAccumulator = null;
+    state.recordingPcm = null;
     state.inputRoute = null;
     state.inputRouteLabel = null;
     state.constraintSettings = null;
@@ -698,7 +737,8 @@ function renderSessionSummary(summary) {
     ["Rejected time", formatNumber(summary.rejectedPercentage, 0, "%")],
     ["Mixed", formatNumber(percent.mixed, 0, "%")],
     ["Tonal", formatNumber(percent.tonal, 0, "%")],
-    ["Low signal", formatNumber((percent.silence || 0) + (percent.insufficient || 0), 0, "%")],
+    ["Low signal", formatNumber(sessionSignalPercentages(percent).lowSignal, 0, "%")],
+    ["Awaiting analysis", formatNumber(sessionSignalPercentages(percent).awaitingAnalysis, 0, "%")],
     ["Mean fit residual", formatNumber(summary.fitRmseMeanDb, 2, " dB")],
   ].map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
   const duration = Math.max(summary.sessionDurationSeconds || 0, Number.EPSILON);
@@ -763,6 +803,7 @@ async function startRecording() {
     state.recording = false;
     state.recorder = null;
     if (!isMicrophoneStartupConflict(error) && !isMicrophoneStartupCancellation(error)) {
+      state.recordingPcm = null;
       await stopMicrophone({ reason: "Microphone unavailable", stateName: "unavailable", preserveSummary: true, silent: true });
     }
   }
@@ -778,11 +819,12 @@ async function stopRecording({ interrupted = false, reason = "" } = {}) {
   elements.recordStatus.textContent = interrupted ? "The recording was interrupted. Finalizing available audio locally…" : "Finalizing and analyzing the recording locally…";
   window.clearInterval(state.recordTimer);
   const recorder = state.recorder;
-  const capturedDurationSeconds = state.startedAt ? (performance.now() - state.startedAt) / 1000 : 0;
-  const fallback = state.rolling?.latest() || new Float32Array();
-  const fallbackRate = state.sampleRate;
+  const samples = state.recordingPcm?.latest() || new Float32Array();
+  state.recordingPcm = null;
+  const sampleRate = state.sampleRate;
   const recordingOptions = currentOptions("recorded-microphone");
-  let audioContext = null;
+  state.pcmTrace?.record("recordingBuffer", samples);
+  const pcmDiagnostics = captureDiagnostics();
   try {
     if (recorder.state !== "inactive") {
       const stopped = new Promise((resolve) => recorder.addEventListener("stop", resolve, { once: true }));
@@ -800,35 +842,23 @@ async function stopRecording({ interrupted = false, reason = "" } = {}) {
     elements.recordButton.hidden = false;
     elements.stopRecordButton.hidden = true;
     await stopMicrophone({ preserveSummary: true, silent: true });
-    audioContext = new (window.AudioContext || window.webkitAudioContext)();
-    let samples;
-    let sampleRate;
-    let decodedFullRecording = true;
-    try {
-      const decoded = await audioContext.decodeAudioData(await state.recordingBlob.arrayBuffer());
-      samples = mixToMono(decoded);
-      sampleRate = decoded.sampleRate;
-    } catch {
-      samples = fallback;
-      sampleRate = fallbackRate;
-      decodedFullRecording = false;
-    }
-    if (!sampleRate || !samples.length) throw new Error("No decodable audio samples were captured.");
+    if (!sampleRate || !samples.length) throw new Error("No Web Audio PCM was captured; the encoded download cannot substitute a different measurement path.");
     const bounded = selectBoundedAnalysisWindow(samples, sampleRate);
-    const sourceDurationSeconds = decodedFullRecording ? bounded.sourceDurationSeconds : Math.max(capturedDurationSeconds, bounded.sourceDurationSeconds);
-    const analysisStartSeconds = decodedFullRecording ? bounded.analysisStartSeconds : Math.max(0, sourceDurationSeconds - bounded.samples.length / sampleRate);
+    const sourceDurationSeconds = (pcmDiagnostics.sessionAccumulator?.sampleCount || samples.length) / sampleRate;
+    const analysisStartSeconds = Math.max(0, sourceDurationSeconds - bounded.samples.length / sampleRate);
     const result = await requestAnalysis("analyze-recording", bounded.samples, sampleRate, {
       ...recordingOptions,
       sourceDurationSeconds,
       analysisStartSeconds,
-      analysisTruncated: bounded.analysisTruncated || !decodedFullRecording || sourceDurationSeconds > bounded.samples.length / sampleRate + 0.01,
+      analysisTruncated: bounded.analysisTruncated || analysisStartSeconds > 0,
+      pcmDiagnostics,
     });
     if (state.recordingAnalysisGeneration !== state.analysisGeneration) return;
     state.latestResult = result;
     renderResult(elements.recordResult, result);
     renderAdvanced(result);
     const windowNote = result.analysisTruncated ? ` The final ${formatDuration(result.durationSeconds)} of ${formatDuration(result.sourceDurationSeconds)} was analyzed.` : "";
-    elements.recordStatus.textContent = `${interrupted ? `${reason || "Recording interrupted"}. ` : ""}Recording analyzed locally.${windowNote} Raw audio remains available only in this page until you leave or download it.`;
+    elements.recordStatus.textContent = `${interrupted ? `${reason || "Recording interrupted"}. ` : ""}Original captured PCM analyzed locally.${windowNote} The download is separately encoded by the browser and may differ slightly.`;
   } catch (error) {
     if (state.recordingAnalysisGeneration !== state.analysisGeneration) return;
     elements.recordStatus.textContent = `Recording could not be analyzed: ${error.message}`;
@@ -836,7 +866,7 @@ async function stopRecording({ interrupted = false, reason = "" } = {}) {
     state.recorder = null;
     await stopMicrophone({ preserveSummary: true, silent: true });
   } finally {
-    await closeAudioContext(audioContext);
+    state.recordingPcm = null;
     elements.recordButton.hidden = false;
     elements.stopRecordButton.hidden = true;
     elements.stopRecordButton.disabled = false;
@@ -1003,6 +1033,7 @@ function resultMarkup(result) {
     <div class="result-grid">
       <div><span>Measured β mean ± SD</span><strong>${formatNumber(result.temporalBetaMean ?? result.beta)} ± ${formatNumber(result.temporalBetaSd)}</strong></div>
       <div><span>Nearest canonical target β</span><strong>${formatNumber(result.canonicalBeta)}</strong></div>
+      ${result.correctedEstimate ? `<div><span>Calibration-derived β (not raw)</span><strong>${formatNumber(result.correctedEstimate.beta)}</strong></div>` : ""}
       <div><span>Fit residual</span><strong>${formatNumber(result.rmseDb, 2, " dB")}</strong></div>
       <div><span>R²</span><strong>${formatNumber(result.r2, 3)}</strong></div>
       <div><span>Raw flatness</span><strong>${formatNumber(result.spectralFlatness, 3)}</strong></div>
@@ -1052,6 +1083,10 @@ function exportCsv(result) {
     ["Welch segments used", result.welchSegments], ["Welch segments available", result.welchAvailableSegments],
     ["fit min Hz", result.fitRange?.[0]], ["fit max Hz", result.fitRange?.[1]], ["analysis mode", result.analysisMode],
     ["analysis window seconds", result.analysisWindowSeconds], ["beta", result.beta], ["raw slope", result.rawSlope],
+    ["raw measured beta", result.rawMeasuredBeta], ["calibration-derived beta", result.correctedEstimate?.beta], ["raw measurement basis", result.rawMeasurement?.basis],
+    ["PCM diagnostics", result.pcmDiagnostics ? JSON.stringify(result.pcmDiagnostics) : ""],
+    ["adjusted breakpoint support octaves", result.abruptBreakpointSupportOctaves], ["adjusted fit minimum basis novelty", result.abruptBreakpointMinimumNovelty],
+    ["discarded adjusted breakpoints", JSON.stringify(result.rejectedAdjustedBreakpoints || [])],
     ["R squared", result.r2], ["RMSE dB", result.rmseDb], ["MAE dB", result.maeDb], ["spectral flatness", result.spectralFlatness], ["slope-normalized flatness", result.slopeNormalizedFlatness],
     ["temporal beta mean", result.temporalBetaMean], ["temporal beta SD", result.temporalBetaSd], ["canonical color", result.canonicalColor], ["canonical beta target", result.canonicalBeta],
     ["canonical distance", result.canonicalDistance], ["classification", result.classification], ["confidence", result.confidence],
@@ -1258,6 +1293,10 @@ function renderAdvanced(result) {
     return;
   }
   const diagnostics = [
+    ["Calibration-derived β (not raw)", formatNumber(result.correctedEstimate?.beta)],
+    ["Adjusted support", formatNumber(result.abruptBreakpointSupportOctaves, 2, " oct")],
+    ["Adjusted basis novelty", formatNumber(result.abruptBreakpointMinimumNovelty, 4)],
+    ["Discarded adjusted fits", `${result.rejectedAdjustedBreakpoints?.length || 0}: ${[...new Set((result.rejectedAdjustedBreakpoints || []).map((item) => item.reason))].join(", ") || "none"}`],
     ["Measured β", formatNumber(result.beta)], ["Nearest canonical target β", formatNumber(result.canonicalBeta)], ["R²", formatNumber(result.r2, 3)], ["RMSE", formatNumber(result.rmseDb, 2, " dB")], ["MAE", formatNumber(result.maeDb, 2, " dB")],
     ["Raw flatness", formatNumber(result.spectralFlatness, 3)], ["Slope-normalized flatness", formatNumber(result.slopeNormalizedFlatness, 3)], ["Broadband occupancy", formatNumber(result.broadbandOccupancy * 100, 0, "%")], ["Level", formatNumber(result.dbfs, 1, " dBFS")], ["Clipping", formatNumber(result.clippingRatio * 100, 3, "%")], ["Near clip", formatNumber(result.nearClipRatio * 100, 2, "%")],
     ["Crest factor", formatNumber(result.crestFactor, 2)], ["Amplitude kurtosis", formatNumber(result.amplitudeKurtosis, 2)], ["Edge density", formatNumber(result.edgeDensityRatio * 100, 1, "%")], ["Peak prominence", formatNumber(result.maxPeakProminenceDb, 1, " dB")], ["Tonal power", formatNumber(result.tonalPowerRatio * 100, 1, "%")], ["Prominent peaks", `${result.prominentPeakCount || 0}`], ["Persistent peaks", `${result.persistentPeakCount || 0}`], ["Harmonic matches", `${result.harmonicPeakCount || 0}`], ["Harmonic evidence", formatNumber(result.harmonicEvidence, 2)],
@@ -1265,10 +1304,14 @@ function renderAdvanced(result) {
     ["Fit range", `${result.fitRange?.[0]}–${Math.round(result.fitRange?.[1] || 0)} Hz`],
     ["Sample rate", `${result.sampleRate} Hz`], ["Welch", `${result.fftSize} FFT · ${result.welchOverlap * 100}% overlap`], ["Correction", result.calibrationProfile || "Uncorrected"], ["Engine", `v${result.analysisEngineVersion}`],
   ];
+  for (const [stage, metric] of Object.entries(result.pcmDiagnostics || {})) {
+    if (!metric || !Number.isFinite(metric.sampleCount)) continue;
+    diagnostics.push([`PCM ${stage}`, `${formatNumber(metric.dbfs, 2, " dBFS")} · RMS ${formatNumber(metric.rms, 5)} · peak ${formatNumber(metric.peak, 5)} · n=${metric.sampleCount} · nonzero ${formatNumber(metric.nonzeroRatio * 100, 1, "%")}`]);
+  }
   elements.diagnosticGrid.innerHTML = diagnostics.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
   elements.measuredCopy.textContent = `Measured β ${formatNumber(result.beta)}; nearest canonical target β ${formatNumber(result.canonicalBeta)}. Residual ${formatNumber(result.rmseDb, 2, " dB")}, R² ${formatNumber(result.r2, 3)}, slope-normalized flatness ${formatNumber(result.slopeNormalizedFlatness, 3)}. ${result.modelAdequacyDetail || ""}`;
   elements.interpretationCopy.textContent = result.qualityDetail;
-  elements.spectrumNote.textContent = `${result.corrected ? `Corrected with ${result.calibrationProfile}` : "Uncorrected continuous PSD"}. β is fitted from ${result.fitRange[0]}–${Math.round(result.fitRange[1])} Hz without A weighting or third-octave aggregation.`;
+  elements.spectrumNote.textContent = `Original, uncorrected continuous PSD. Raw β is fitted from ${result.fitRange[0]}–${Math.round(result.fitRange[1])} Hz without A weighting, curvature removal, or third-octave aggregation.${result.correctedEstimate ? ` Calibration-derived β ${formatNumber(result.correctedEstimate.beta)} is a separate diagnostic, not the measured trend or classification input.` : ""}`;
 }
 
 function loadCalibrationProfiles() {
@@ -1298,7 +1341,7 @@ function selectCalibration() {
   if (!state.activeCalibration) elements.calibrationState.textContent = "Uncorrected";
   else if (!state.inputRoute) elements.calibrationState.textContent = `Available for ${state.activeCalibration.routeId}; not applied until the input route matches`;
   else if (state.activeCalibration.routeId !== state.inputRoute) elements.calibrationState.textContent = `Not applied: profile does not match ${state.inputRouteLabel || "the current source"}`;
-  else elements.calibrationState.textContent = `Corrected with ${state.activeCalibration.name}`;
+  else elements.calibrationState.textContent = `${state.activeCalibration.name}: separate corrected estimate; raw β is unchanged`;
 }
 
 function showInstallSheet(platform = platformInstallHint()) {
