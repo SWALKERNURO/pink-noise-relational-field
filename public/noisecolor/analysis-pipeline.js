@@ -1,6 +1,6 @@
-import { analyzeSamples, analyzeRecording, FFT_SIZE, WELCH_OVERLAP, DEFAULT_FIT_RANGE } from "./analysis-engine.js?v=0.6.8-recovery.2";
-import { normalizePcm } from "./pcm-input.js?v=0.6.8-recovery.2";
-import { pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.2";
+import { analyzeSamples, analyzeRecording, FFT_SIZE, WELCH_OVERLAP, DEFAULT_FIT_RANGE } from "./analysis-engine.js?v=0.6.8-recovery.3";
+import { normalizePcm } from "./pcm-input.js?v=0.6.8-recovery.3";
+import { pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.3";
 
 export const PRIMARY_ANALYSIS_CONFIG = Object.freeze({ fftSize: FFT_SIZE, overlap: WELCH_OVERLAP, fitRange: Object.freeze([...DEFAULT_FIT_RANGE]), maxWelchSegments: 48 });
 const PATHS = { live: "live", recording: "recorded-microphone", upload: "uploaded-file" };

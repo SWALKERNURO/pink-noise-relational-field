@@ -6,14 +6,14 @@ An interactive scientific visualization of posterior EEG 1/f structure, eye-move
 
 ## Download / Install NoiseColor
 
-NoiseColor is a mobile-first Progressive Web App for live microphone spectral-color analysis. The installable PWA is the iPhone and Android app experience; it is not currently distributed through the Apple App Store or Google Play.
+NoiseColor is a mobile-first web app for live microphone spectral-color analysis. For iPhone/iPad microphone capture, use a Safari Home Screen shortcut. Android supports the installable PWA. NoiseColor is not currently distributed through the Apple App Store or Google Play.
 
 <a href="https://swalkernuro.github.io/pink-noise-relational-field/noisecolor/?install=ios"><img src="docs/assets/install-noisecolor-iphone.png" alt="Install NoiseColor on iPhone" width="280"></a>
 <a href="https://swalkernuro.github.io/pink-noise-relational-field/noisecolor/?install=android"><img src="docs/assets/install-noisecolor-android.png" alt="Install NoiseColor on Android" width="280"></a>
 
 **[Open NoiseColor Web App](https://swalkernuro.github.io/pink-noise-relational-field/noisecolor/)**
 
-On iPhone or iPad, open the iPhone link in Safari, use **Share → Add to Home Screen**, enable/open as a web app where offered, and tap **Add**. On Android, the install control opens the native PWA prompt when Chromium exposes it; otherwise NoiseColor shows concise browser-specific instructions.
+On iPhone or iPad, open the iPhone link in Safari and allow microphone access. Use **Share → Add to Home Screen → Open as Web App OFF → Add**. This creates a browser shortcut. Apple’s standalone web-app mode may block microphone access on affected iOS versions/devices; it is not the recommended Live/Record setup. If the switch is unavailable, use Safari directly. See the [iPhone compatibility acceptance procedure](docs/noisecolor-ios-compatibility.md). On Android, the install control opens the native PWA prompt when Chromium exposes it; otherwise NoiseColor shows concise browser-specific instructions.
 
 **Audio is analyzed locally and is not uploaded to a server.** Live Analysis keeps only a bounded rolling buffer in memory and does not persist raw microphone audio. Recording and raw-audio download are explicit, opt-in actions.
 
