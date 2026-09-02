@@ -55,14 +55,14 @@ NoiseColor estimates the spectral exponent β in `P(f) ∝ 1/f^β` with Welch po
 - local WAV, MP3, M4A, AAC, OGG, and FLAC files supported by the browser;
 - mono mixing for multichannel files;
 - PCM WAV files up to 40 MB, decoded directly from only the final bounded tail;
-- compressed files up to 12 MB and 120 seconds only after container layout, media duration, channel count, sample rate, and a 128 MB decoded-working-memory estimate pass preflight;
+- compressed files up to 12 MB and 120 seconds only after container layout, media duration, channel count, sample rate, and a 128 MiB peak simultaneous-memory estimate pass preflight;
 - temporal β analysis with mean, standard deviation, history, a 500 ms activity timeline, and separate whole-session counters that are not truncated with chart history;
 - continuous PSD, contextual third-octave bands, a live spectrogram, fit diagnostics, spectral flatness, signal level, and clipping checks;
 - optional, named, input-route-specific microphone frequency-response correction profiles;
 - local-only IndexedDB history for compact metadata and analysis summaries, never raw audio by default, limited to the 100 most recent saved results with mobile pagination over 25-record cursor pages;
 - reproducible JSON and CSV exports containing estimator, fit, quality, source, complete calibration correction points and hash, privacy-safe route labels, and version metadata.
 
-Uncompressed PCM WAV files are parsed directly so only the final bounded analysis window is converted to mono PCM. Browser `decodeAudioData()` cannot stream or decode only a tail, so compressed audio is rejected before decoding unless its container layout and duration can be inspected and its complete decoded working set stays within the conservative mobile limit. Potentially unsafe or unverifiable compressed containers are rejected with a conversion/trim explanation.
+Uncompressed PCM WAV files are parsed directly so only the final bounded analysis window is converted to mono PCM. Browser `decodeAudioData()` cannot stream or decode only a tail, so compressed audio is rejected before decoding unless its container layout and duration can be inspected and the encoded buffer, decoded channel PCM, mono output, and conservative decoder/AudioContext overhead fit together under the mobile peak-memory limit. Potentially unsafe or unverifiable compressed containers are rejected with a conversion/trim explanation.
 
 The canonical β estimate always uses the **unweighted continuous PSD**. Third-octave and future acoustic weighting views are secondary context only and never drive noise-color classification. Scalar gain/SPL calibration does not materially change β; optional frequency-response correction can change β and is therefore reported transparently.
 

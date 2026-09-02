@@ -104,6 +104,7 @@ canvas { display: block; width: 100%; height: auto; margin-top: 14px; background
 .summary-timeline .pink { background: var(--pink); }
 .summary-timeline .brown { background: var(--brown); }
 .summary-timeline .mixed, .summary-timeline .tonal, .summary-timeline .unstable { background: var(--warn); }
+.summary-timeline .session-compressed { background: repeating-linear-gradient(135deg, var(--blue) 0 4px, var(--pink) 4px 8px, var(--muted) 8px 12px); }
 .summary-timeline .silence, .summary-timeline .insufficient, .summary-timeline .paused { background: var(--muted); }
 .summary-timeline .clipping, .summary-timeline .unavailable, .summary-timeline .invalid { background: var(--danger); }
 .action-panel { padding: 18px; display: grid; gap: 12px; }

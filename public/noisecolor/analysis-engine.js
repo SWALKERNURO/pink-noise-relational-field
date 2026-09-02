@@ -1,5 +1,5 @@
-export const APP_VERSION = "0.6.4";
-export const ENGINE_VERSION = "0.6.4";
+export const APP_VERSION = "0.6.6";
+export const ENGINE_VERSION = "0.6.6";
 export const FFT_SIZE = 4096;
 export const WELCH_OVERLAP = 0.5;
 export const DEFAULT_FIT_RANGE = [100, 8000];
@@ -220,7 +220,31 @@ function regressPoints(xs, ys) {
   return { beta: -slope, slope, intercept, rmseDb: 10 * Math.sqrt(squaredError / xs.length) };
 }
 
-export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFrequency, binCount = 24) {
+function hingeRegressPoints(xs, ys, breakpointX) {
+  const hinge = xs.map((x) => Math.max(0, x - breakpointX));
+  const hingeTrend = regressPoints(xs, hinge);
+  if (!Number.isFinite(hingeTrend.slope)) return null;
+  const residualizedHinge = hinge.map((value, index) => value - hingeTrend.intercept - hingeTrend.slope * xs[index]);
+  const hingeEnergy = residualizedHinge.reduce((sum, value) => sum + value * value, 0);
+  if (hingeEnergy <= Number.EPSILON) return null;
+  const hingeCoefficient = residualizedHinge.reduce((sum, value, index) => sum + value * ys[index], 0) / hingeEnergy;
+  const adjusted = ys.map((value, index) => value - hingeCoefficient * hinge[index]);
+  const base = regressPoints(xs, adjusted);
+  if (!Number.isFinite(base.slope)) return null;
+  const squaredError = ys.reduce((sum, value, index) => {
+    const predicted = base.intercept + base.slope * xs[index] + hingeCoefficient * hinge[index];
+    return sum + (value - predicted) ** 2;
+  }, 0);
+  return {
+    lowBeta: -base.slope,
+    highBeta: -(base.slope + hingeCoefficient),
+    slopeDelta: Math.abs(hingeCoefficient),
+    squaredError,
+    rmseDb: 10 * Math.sqrt(squaredError / xs.length),
+  };
+}
+
+export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFrequency, binCount = 48) {
   const logMin = Math.log10(minFrequency);
   const logMax = Math.log10(maxFrequency);
   const buckets = Array.from({ length: binCount }, () => []);
@@ -239,27 +263,30 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
   const xs = points.map((point) => point.x);
   const ys = points.map((point) => point.y);
   const overall = regressPoints(xs, ys);
+  const overallSquaredError = Number.isFinite(overall.rmseDb) ? (overall.rmseDb / 10) ** 2 * points.length : Infinity;
   const split = Math.floor(points.length / 2);
   const low = regressPoints(xs.slice(0, split), ys.slice(0, split));
   const high = regressPoints(xs.slice(split), ys.slice(split));
-  let strongestBreakpoint = { slopeDelta: 0, frequency: null, piecewiseRmseDb: Infinity, improvementDb: 0 };
-  for (let breakpoint = 5; breakpoint <= points.length - 5; breakpoint += 1) {
-    const left = regressPoints(xs.slice(0, breakpoint), ys.slice(0, breakpoint));
-    const right = regressPoints(xs.slice(breakpoint), ys.slice(breakpoint));
-    if (!Number.isFinite(left.beta) || !Number.isFinite(right.beta)) continue;
-    const leftSquared = (left.rmseDb / 10) ** 2 * breakpoint;
-    const rightSquared = (right.rmseDb / 10) ** 2 * (points.length - breakpoint);
-    const piecewiseRmseDb = 10 * Math.sqrt((leftSquared + rightSquared) / points.length);
-    const slopeDelta = Math.abs(left.beta - right.beta);
-    const improvementDb = overall.rmseDb - piecewiseRmseDb;
-    const score = slopeDelta * Math.max(0, improvementDb);
-    const strongestScore = strongestBreakpoint.slopeDelta * Math.max(0, strongestBreakpoint.improvementDb);
-    if (score > strongestScore) {
+  let strongestBreakpoint = { slopeDelta: 0, frequency: null, piecewiseRmseDb: Infinity, improvementDb: 0, relativeImprovement: 0, evidence: 0, supportBins: 0 };
+  // Low-frequency log bins contain far fewer FFT ordinates, so require seven below
+  // a candidate while allowing two dense high-frequency bins above an edge break.
+  for (let breakpoint = 7; breakpoint <= points.length - 2; breakpoint += 1) {
+    const breakpointX = (points[breakpoint - 1].x + points[breakpoint].x) / 2;
+    const piecewise = hingeRegressPoints(xs, ys, breakpointX);
+    if (!piecewise) continue;
+    const improvementDb = overall.rmseDb - piecewise.rmseDb;
+    const relativeImprovement = overallSquaredError > 0 ? Math.max(0, 1 - piecewise.squaredError / overallSquaredError) : 0;
+    const supportBins = Math.min(breakpoint, points.length - breakpoint);
+    const evidence = piecewise.slopeDelta * relativeImprovement * Math.sqrt(supportBins);
+    if (evidence > strongestBreakpoint.evidence) {
       strongestBreakpoint = {
-        slopeDelta,
-        frequency: 10 ** ((points[breakpoint - 1].x + points[breakpoint].x) / 2),
-        piecewiseRmseDb,
+        slopeDelta: piecewise.slopeDelta,
+        frequency: 10 ** breakpointX,
+        piecewiseRmseDb: piecewise.rmseDb,
         improvementDb,
+        relativeImprovement,
+        evidence,
+        supportBins,
       };
     }
   }
@@ -274,6 +301,9 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
     strongestBreakpointFrequency: strongestBreakpoint.frequency,
     piecewiseRmseDb: strongestBreakpoint.piecewiseRmseDb,
     piecewiseImprovementDb: strongestBreakpoint.improvementDb,
+    piecewiseRelativeImprovement: strongestBreakpoint.relativeImprovement,
+    breakpointEvidence: strongestBreakpoint.evidence,
+    breakpointSupportBins: strongestBreakpoint.supportBins,
   };
 }
 
@@ -396,7 +426,10 @@ export function qualityGate({ durationSeconds, input, flatness, fit, tonality = 
   const extremePeak = tonality.maxPeakProminenceDb >= 24 && tonality.tonalPowerRatio >= 0.015;
   if (flatness < 0.055 || narrowbandPeak || extremePeak) return { state: "tonal", label: "Tonal / non-noise", reliable: false, detail: "Prominent narrowband energy or harmonics do not behave like broadband colored noise." };
   const fixedHalfMismatch = modelAdequacy.segmentedSlopeDelta > 0.75 && modelAdequacy.logBinnedRmseDb > 0.85;
-  const rollingBreakpointMismatch = modelAdequacy.maxBreakpointSlopeDelta > 0.85 && modelAdequacy.piecewiseImprovementDb > 0.32 && modelAdequacy.logBinnedRmseDb > 0.65;
+  const rollingBreakpointMismatch = modelAdequacy.maxBreakpointSlopeDelta >= 0.55
+    && modelAdequacy.piecewiseImprovementDb >= 0.012
+    && modelAdequacy.piecewiseRelativeImprovement >= 0.18
+    && modelAdequacy.breakpointEvidence >= 0.2;
   const inconsistentSlopes = fixedHalfMismatch || rollingBreakpointMismatch;
   if (!Number.isFinite(fit.beta) || fit.beta < -2.8 || fit.beta > 2.8 || fit.rmseDb > 5.2 || inconsistentSlopes) {
     return { state: "mixed", label: "Mixed / non-power-law", reliable: false, detail: "One power-law slope does not adequately describe this spectrum." };
@@ -530,6 +563,9 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     strongestBreakpointFrequency: modelAdequacy.strongestBreakpointFrequency,
     piecewiseRmseDb: modelAdequacy.piecewiseRmseDb,
     piecewiseImprovementDb: modelAdequacy.piecewiseImprovementDb,
+    piecewiseRelativeImprovement: modelAdequacy.piecewiseRelativeImprovement,
+    breakpointEvidence: modelAdequacy.breakpointEvidence,
+    breakpointSupportBins: modelAdequacy.breakpointSupportBins,
     classification: quality.label,
     state: quality.state,
     confidence: quality.confidence || "None",
@@ -578,9 +614,22 @@ export function buildColorTimeline(observations, durationSeconds = observations.
 }
 
 const SESSION_STATE_KEYS = [...CANONICAL_COLORS.map((color) => color.key), "mixed", "tonal", "silence", "unstable", "clipping", "insufficient", "invalid"];
+export const MAX_SESSION_TIMELINE_SEGMENTS = 2048;
 
 function emptyStateDurations() {
   return Object.fromEntries(SESSION_STATE_KEYS.map((key) => [key, 0]));
+}
+
+function timelineStateDurations(timeline) {
+  const durations = emptyStateDurations();
+  for (const segment of timeline) {
+    if (segment.compressed && segment.stateDurations) {
+      for (const [state, duration] of Object.entries(segment.stateDurations)) durations[state] = (durations[state] || 0) + Math.max(0, Number(duration) || 0);
+    } else {
+      durations[segment.state] = (durations[segment.state] || 0) + Math.max(0, segment.endSeconds - segment.startSeconds);
+    }
+  }
+  return durations;
 }
 
 function activityState(samples, fallback = null) {
@@ -655,6 +704,7 @@ export class SessionAccumulator {
     this.pendingLength = 0;
     this.durations = emptyStateDurations();
     this.durationSeconds = 0;
+    this.timeline = [];
     this.observations = { count: 0, betaMean: 0, betaM2: 0, rmseSum: 0, r2Sum: 0, flatnessSum: 0 };
   }
 
@@ -671,9 +721,39 @@ export class SessionAccumulator {
 
   commitFrame(samples, durationSeconds, fallback) {
     const classified = activityState(samples, fallback);
+    const startSeconds = this.durationSeconds;
+    const endSeconds = startSeconds + durationSeconds;
     this.durations[classified.state] = (this.durations[classified.state] || 0) + durationSeconds;
-    this.durationSeconds += durationSeconds;
+    const previous = this.timeline.at(-1);
+    if (previous && !previous.compressed && previous.state === classified.state && previous.label === classified.label) {
+      previous.endSeconds = endSeconds;
+    } else {
+      this.timeline.push({ ...classified, startSeconds, endSeconds });
+    }
+    this.durationSeconds = endSeconds;
+    if (this.timeline.length > MAX_SESSION_TIMELINE_SEGMENTS) this.compressTimeline();
     this.pendingLength = 0;
+  }
+
+  compressTimeline() {
+    const count = Math.ceil(MAX_SESSION_TIMELINE_SEGMENTS / 2);
+    const compacted = this.timeline.splice(0, count);
+    const stateDurations = timelineStateDurations(compacted);
+    const startSeconds = compacted[0]?.startSeconds || 0;
+    const endSeconds = compacted.at(-1)?.endSeconds || startSeconds;
+    const composition = Object.entries(stateDurations)
+      .filter(([, duration]) => duration > 0)
+      .map(([state, duration]) => `${state} ${((duration / Math.max(endSeconds - startSeconds, Number.EPSILON)) * 100).toFixed(1)}%`)
+      .join(", ");
+    this.timeline.unshift({
+      state: "session-compressed",
+      label: `Compressed earlier session states: ${composition}`,
+      startSeconds,
+      endSeconds,
+      reliable: false,
+      compressed: true,
+      stateDurations,
+    });
   }
 
   addObservation(observation) {
@@ -692,8 +772,9 @@ export class SessionAccumulator {
     if (this.pendingLength) this.commitFrame(this.pending.subarray(0, this.pendingLength), this.pendingLength / this.sampleRate, fallback);
   }
 
-  summary(visualObservations = [], visualTimeline = []) {
-    const summary = summarizeWithDurations(visualObservations, this.durationSeconds, { ...this.durations }, visualTimeline);
+  summary(visualObservations = []) {
+    const colorTimeline = this.timeline.map((segment) => ({ ...segment, stateDurations: segment.stateDurations ? { ...segment.stateDurations } : undefined }));
+    const summary = summarizeWithDurations(visualObservations, this.durationSeconds, { ...this.durations }, colorTimeline);
     const stats = this.observations;
     if (stats.count) {
       summary.betaMean = stats.betaMean;
@@ -705,6 +786,10 @@ export class SessionAccumulator {
     }
     summary.aggregateObservationCount = stats.count;
     summary.statisticsCoverFullSession = true;
+    summary.timelineStateDurations = timelineStateDurations(colorTimeline);
+    summary.timelineCoversFullSession = Math.abs((colorTimeline.at(-1)?.endSeconds || 0) - this.durationSeconds) <= 1 / this.sampleRate;
+    summary.timelineMatchesAggregates = SESSION_STATE_KEYS.every((key) => Math.abs(summary.timelineStateDurations[key] - this.durations[key]) <= 1 / this.sampleRate);
+    summary.timelineCompressed = colorTimeline.some((segment) => segment.compressed);
     return summary;
   }
 }
@@ -740,7 +825,14 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
     flatness: overall.spectralFlatness,
     fit: { beta: overall.beta, rmseDb: overall.rmseDb },
     tonality: { maxPeakProminenceDb: overall.maxPeakProminenceDb, tonalPowerRatio: overall.tonalPowerRatio },
-    modelAdequacy: { segmentedSlopeDelta: overall.segmentedSlopeDelta, logBinnedRmseDb: overall.logBinnedRmseDb, maxBreakpointSlopeDelta: overall.maxBreakpointSlopeDelta, piecewiseImprovementDb: overall.piecewiseImprovementDb },
+    modelAdequacy: {
+      segmentedSlopeDelta: overall.segmentedSlopeDelta,
+      logBinnedRmseDb: overall.logBinnedRmseDb,
+      maxBreakpointSlopeDelta: overall.maxBreakpointSlopeDelta,
+      piecewiseImprovementDb: overall.piecewiseImprovementDb,
+      piecewiseRelativeImprovement: overall.piecewiseRelativeImprovement,
+      breakpointEvidence: overall.breakpointEvidence,
+    },
     temporalSd: reliableSummary.sd || 0,
   });
   const activityTimeline = buildActivityTimeline(samples, sampleRate, observations, options.activityFrameSeconds || 0.5);

@@ -1,4 +1,4 @@
-import { analyzeRecording, analyzeSamples, buildSpectrogram } from "./analysis-engine.js?v=0.6.4";
+import { analyzeRecording, analyzeSamples, buildSpectrogram } from "./analysis-engine.js?v=0.6.6";
 
 self.addEventListener("message", (event) => {
   const { id, type, samples: rawSamples, sampleRate, options } = event.data;

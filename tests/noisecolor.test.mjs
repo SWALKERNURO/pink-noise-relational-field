@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   APP_VERSION,
   ENGINE_VERSION,
+  MAX_SESSION_TIMELINE_SEGMENTS,
   SessionAccumulator,
   analyzeRecording,
   analyzeSamples,
@@ -17,7 +18,8 @@ import {
 import { ColorStateMachine } from "../public/noisecolor/live-state.js";
 import { MODE_CONFIG, RollingBuffer, selectBoundedAnalysisWindow } from "../public/noisecolor/live-runtime.js";
 import { compactMeasurement, historyPaginationState, HISTORY_PAGE_SIZE, HISTORY_RETENTION_LIMIT } from "../public/noisecolor/history.js";
-import { assessCompressedUploadSafety, inspectCompressedLayout, preflightCompressedUpload } from "../public/noisecolor/upload-safety.js";
+import { MAX_DECODE_WORKING_BYTES, assessCompressedUploadSafety, estimateCompressedDecodePeakBytes, inspectCompressedLayout, preflightCompressedUpload } from "../public/noisecolor/upload-safety.js";
+import { MicrophoneStartupLock, isMicrophoneStartupCancellation } from "../public/noisecolor/microphone-startup.js";
 
 function randomGenerator(seed = 123456789) {
   let value = seed >>> 0;
@@ -70,13 +72,14 @@ function piecewiseNoise({ sampleRate = 16000, size = 65536, seed = 19 } = {}) {
   return Float32Array.from(real, (sample) => (sample / currentRms) * 0.18);
 }
 
-function twoRegimeNoise({ sampleRate = 16000, size = 65536, seed = 73, breakpoint = 1000 } = {}) {
+function twoRegimeNoise({ sampleRate = 16000, size = 65536, seed = 73, breakpoint = 1000, lowBeta = 0, highBeta = 2 } = {}) {
   const random = randomGenerator(seed);
   const real = new Float64Array(size);
   const imaginary = new Float64Array(size);
   for (let bin = 1; bin < size / 2; bin += 1) {
     const frequency = (bin * sampleRate) / size;
-    const magnitude = frequency < breakpoint ? 1 : (frequency / breakpoint) ** -1;
+    const beta = frequency < breakpoint ? lowBeta : highBeta;
+    const magnitude = (frequency / breakpoint) ** (-beta / 2);
     const phase = random() * 2 * Math.PI;
     real[bin] = magnitude * Math.cos(phase);
     imaginary[bin] = magnitude * Math.sin(phase);
@@ -153,14 +156,78 @@ test("two-regime spectra fail the single-power-law adequacy gate", () => {
   assert.ok(result.segmentedSlopeDelta > 0.75);
 });
 
-test("multi-breakpoint adequacy rejects strong slope changes away from the midpoint", () => {
-  for (const breakpoint of [500, 1000, 2000, 4000]) {
-    const result = analyzeSamples(twoRegimeNoise({ breakpoint, seed: 730 + breakpoint }), 16000, analysisOptions);
-    assert.equal(result.reliable, false, `breakpoint ${breakpoint} Hz was incorrectly reliable (β ${result.beta})`);
-    assert.equal(result.state, "mixed", `breakpoint ${breakpoint} Hz should fail the single-power-law gate`);
-    assert.ok(result.maxBreakpointSlopeDelta > 0.85, `breakpoint ${breakpoint} Hz produced Δβ ${result.maxBreakpointSlopeDelta}`);
-    assert.ok(result.piecewiseImprovementDb > 0.32, `breakpoint ${breakpoint} Hz improvement was ${result.piecewiseImprovementDb} dB`);
+test("log-balanced breakpoint matrix rejects detectable two-regime spectra across the fit range", () => {
+  const betaPairs = [[0, 1], [1, 0], [0, 1.5], [1.5, 0], [0, 2], [2, 0]];
+  for (const breakpoint of [250, 500, 1000, 2000, 4000, 6000]) {
+    for (const [lowBeta, highBeta] of betaPairs) {
+      const seed = 730 + breakpoint + Math.round(lowBeta * 31 + highBeta * 47);
+      const result = analyzeSamples(twoRegimeNoise({ breakpoint, lowBeta, highBeta, seed }), 16000, analysisOptions);
+      const fixture = `${lowBeta}→${highBeta} at ${breakpoint} Hz`;
+      assert.notEqual(result.confidence, "High", `${fixture} received a High-confidence ${result.classification} label (Δβ ${result.maxBreakpointSlopeDelta}, improvement ${result.piecewiseImprovementDb} dB)`);
+      assert.equal(result.reliable, false, `${fixture} was incorrectly reliable (β ${result.beta}, Δβ ${result.maxBreakpointSlopeDelta}, relative improvement ${result.piecewiseRelativeImprovement})`);
+      assert.equal(result.state, "mixed", `${fixture} should fail the single-power-law gate`);
+      assert.ok(result.piecewiseRelativeImprovement > 0, `${fixture} did not improve over a single slope`);
+    }
   }
+});
+
+test("microphone startup lock prevents duplicate acquisition and releases partial resources on cancellation", async () => {
+  const lock = new MicrophoneStartupLock();
+  let resolveAcquisition;
+  const acquisition = new Promise((resolve) => { resolveAcquisition = resolve; });
+  let streamAcquisitions = 0;
+  let contextAcquisitions = 0;
+  let stoppedTracks = 0;
+  let closedContexts = 0;
+  const start = () => lock.run(async (startup) => {
+    streamAcquisitions += 1;
+    const stream = await acquisition;
+    await startup.track(stream, (resource) => { resource.stopped = true; stoppedTracks += 1; });
+    contextAcquisitions += 1;
+    const context = { closed: false };
+    await startup.track(context, (resource) => { resource.closed = true; closedContexts += 1; });
+    startup.commit();
+    return { stream, context };
+  });
+  const first = start();
+  await assert.rejects(start(), /already in progress/);
+  resolveAcquisition({ stopped: false });
+  const live = await first;
+  assert.deepEqual([streamAcquisitions, contextAcquisitions], [1, 1]);
+  assert.deepEqual([live.stream.stopped, live.context.closed], [false, false]);
+
+  const cancellationLock = new MicrophoneStartupLock();
+  let continueStartup;
+  const pause = new Promise((resolve) => { continueStartup = resolve; });
+  const partialStream = { stopped: false };
+  const partialContext = { closed: false };
+  const cancelled = cancellationLock.run(async (startup) => {
+    await startup.track(partialStream, (resource) => { resource.stopped = true; stoppedTracks += 1; });
+    await startup.track(partialContext, (resource) => { resource.closed = true; closedContexts += 1; });
+    await pause;
+    startup.checkpoint();
+    startup.commit();
+  });
+  assert.equal(await cancellationLock.cancel(), true);
+  continueStartup();
+  await assert.rejects(cancelled, (error) => isMicrophoneStartupCancellation(error));
+  assert.deepEqual([partialStream.stopped, partialContext.closed], [true, true]);
+  assert.deepEqual([stoppedTracks, closedContexts], [1, 1]);
+  assert.equal(cancellationLock.pending, false);
+
+  const lateAcquisitionLock = new MicrophoneStartupLock();
+  let resolveLateStream;
+  const lateStreamPromise = new Promise((resolve) => { resolveLateStream = resolve; });
+  const lateStream = { stopped: false };
+  const lateStart = lateAcquisitionLock.run(async (startup) => {
+    const stream = await lateStreamPromise;
+    await startup.track(stream, (resource) => { resource.stopped = true; });
+    throw new Error("context construction must not be reached after cancellation");
+  });
+  assert.equal(await lateAcquisitionLock.cancel(), true);
+  resolveLateStream(lateStream);
+  await assert.rejects(lateStart, (error) => isMicrophoneStartupCancellation(error));
+  assert.equal(lateStream.stopped, true);
 });
 
 test("quality gates reject tonal input, silence, clipping, and short input", () => {
@@ -350,6 +417,20 @@ test("compressed uploads require verified bounded decoded-memory preflight", asy
   assert.equal(assessCompressedUploadSafety({ encodedBytes: 1024 * 1024, durationSeconds: 121, ...layout }).safe, false);
   assert.equal(assessCompressedUploadSafety({ encodedBytes: 1024 * 1024, durationSeconds: 60, sampleRate: null, channels: null, metadataVerified: false }).safe, false);
   assert.equal(assessCompressedUploadSafety({ encodedBytes: 1024 * 1024, durationSeconds: 120, sampleRate: 192000, channels: 8, metadataVerified: true }).safe, false);
+  const adversarial = assessCompressedUploadSafety({ encodedBytes: 12 * 1024 * 1024, durationSeconds: 120, sampleRate: 88200, channels: 2, metadataVerified: true });
+  assert.equal(adversarial.safe, false);
+  assert.ok(adversarial.encodedArrayBufferBytes + adversarial.decodedChannelPcmBytes + adversarial.monoOutputBytes + adversarial.decoderOverheadBytes > MAX_DECODE_WORKING_BYTES);
+
+  const encodedBytes = 1024 * 1024;
+  const sampleRate = 96000;
+  const channels = 2;
+  const bytesPerFrameAtBoundary = channels * 4 + 4 + channels * 4 * 0.5;
+  const boundaryFrames = Math.floor((MAX_DECODE_WORKING_BYTES - encodedBytes) / bytesPerFrameAtBoundary);
+  const below = assessCompressedUploadSafety({ encodedBytes, durationSeconds: (boundaryFrames - 1) / sampleRate, sampleRate, channels, metadataVerified: true });
+  const above = assessCompressedUploadSafety({ encodedBytes, durationSeconds: (boundaryFrames + 1) / sampleRate, sampleRate, channels, metadataVerified: true });
+  assert.equal(below.safe, true, `below-boundary estimate was ${below.estimatedPeakBytes}`);
+  assert.equal(above.safe, false, `above-boundary estimate was ${above.estimatedPeakBytes}`);
+  assert.ok(estimateCompressedDecodePeakBytes({ encodedBytes, durationSeconds: (boundaryFrames - 1) / sampleRate, sampleRate, channels }).estimatedPeakBytes <= MAX_DECODE_WORKING_BYTES);
   const preflight = await preflightCompressedUpload({ size: 1024 * 1024 }, mp3Frame.buffer, async () => 60);
   assert.equal(preflight.durationSeconds, 60);
   await assert.rejects(() => preflightCompressedUpload({ size: 1024 * 1024 }, new Uint8Array(32).buffer, async () => 1), /cannot be safely inspected/);
@@ -427,14 +508,15 @@ test("pink to white to blue transitions keep stable label, beta, and confidence 
   assert.equal(noisyConfidence.confidence, "Low");
 });
 
-test("full-session accumulator survives visualization retention truncation", () => {
+test("full-session timeline and aggregates survive visualization retention truncation", () => {
   const sampleRate = 100;
   const accumulator = new SessionAccumulator(sampleRate, 0.5);
   const frame = Float32Array.from({ length: 50 }, (_, index) => 0.1 * Math.sin(index * 0.71) + 0.03 * Math.sin(index * 1.37));
   const retained = [];
   for (let index = 0; index < 4001; index += 1) {
-    const pink = index >= 500;
-    const observation = { timeSeconds: index * 0.5, beta: pink ? 1 : 0, state: pink ? "pink" : "white", classification: pink ? "Pink-like" : "White-like", reliable: true, rmseDb: 1, r2: 0.8, spectralFlatness: 0.7 };
+    const state = index < 200 ? "blue" : index < 500 ? "white" : "pink";
+    const beta = state === "blue" ? -1 : state === "white" ? 0 : 1;
+    const observation = { timeSeconds: index * 0.5, beta, state, classification: `${state[0].toUpperCase()}${state.slice(1)}-like`, reliable: true, rmseDb: 1, r2: 0.8, spectralFlatness: 0.7 };
     accumulator.addAudio(frame, observation);
     accumulator.addObservation(observation);
     retained.push(observation);
@@ -444,10 +526,33 @@ test("full-session accumulator survives visualization retention truncation", () 
   assert.equal(retained.length, 3600);
   assert.equal(summary.aggregateObservationCount, 4001);
   assert.equal(summary.sessionDurationSeconds, 2000.5);
-  assert.ok(Math.abs(summary.percentages.white - (500 / 4001) * 100) < 0.01);
+  assert.ok(Math.abs(summary.percentages.blue - (200 / 4001) * 100) < 0.01);
+  assert.ok(Math.abs(summary.percentages.white - (300 / 4001) * 100) < 0.01);
   assert.ok(Math.abs(summary.percentages.pink - (3501 / 4001) * 100) < 0.01);
-  assert.ok(Math.abs(summary.betaMean - 3501 / 4001) < 1e-9);
+  assert.ok(Math.abs(summary.betaMean - (3501 - 200) / 4001) < 1e-9);
+  assert.deepEqual(summary.colorTimeline.map(({ state, startSeconds, endSeconds }) => ({ state, startSeconds, endSeconds })), [
+    { state: "blue", startSeconds: 0, endSeconds: 100 },
+    { state: "white", startSeconds: 100, endSeconds: 250 },
+    { state: "pink", startSeconds: 250, endSeconds: 2000.5 },
+  ]);
   assert.equal(summary.statisticsCoverFullSession, true);
+  assert.equal(summary.timelineCoversFullSession, true);
+  assert.equal(summary.timelineMatchesAggregates, true);
+  assert.deepEqual([summary.timelineStateDurations.blue, summary.timelineStateDurations.white, summary.timelineStateDurations.pink], [100, 150, 1750.5]);
+});
+
+test("full-session run timeline remains bounded while preserving state-duration composition", () => {
+  const accumulator = new SessionAccumulator(10, 0.5);
+  const frame = Float32Array.from({ length: 5 }, (_, index) => 0.12 * Math.sin(index + 0.4));
+  for (let index = 0; index < MAX_SESSION_TIMELINE_SEGMENTS + 100; index += 1) {
+    const state = index % 2 ? "blue" : "pink";
+    accumulator.addAudio(frame, { state, classification: `${state}-like`, reliable: true });
+  }
+  const summary = accumulator.summary();
+  assert.ok(summary.colorTimeline.length <= MAX_SESSION_TIMELINE_SEGMENTS);
+  assert.equal(summary.timelineCompressed, true);
+  assert.equal(summary.timelineCoversFullSession, true);
+  assert.equal(summary.timelineMatchesAggregates, true);
 });
 
 test("NoiseColor PWA paths and mobile lifecycle contracts stay scoped", async () => {
@@ -497,11 +602,15 @@ test("NoiseColor PWA paths and mobile lifecycle contracts stay scoped", async ()
   assert.match(app, /Promise\.race/);
   assert.match(app, /audioContext\.state !== "running"/);
   assert.match(app, /await closeAudioContext\(audioContext\)/);
+  assert.match(app, /new MicrophoneStartupLock\(\)/);
+  assert.match(app, /await cancelMicrophoneStartup\(\)/);
+  assert.match(app, /microphoneStartup\.pending/);
   assert.match(app, /MAX_RECORDING_SECONDS/);
   assert.match(app, /MAX_RECORDING_BYTES/);
   assert.match(app, /decodePcmWavTail/);
   assert.match(app, /preflightCompressedUpload/);
   assert.match(serviceWorker, /upload-safety\.js/);
+  assert.match(serviceWorker, /microphone-startup\.js/);
   assert.match(html, /id="historyPageStatus" role="status" aria-live="polite"/);
   assert.match(app, /state\.workerBusy/);
   assert.match(html, /id="clearButton"/);

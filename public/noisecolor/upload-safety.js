@@ -1,6 +1,8 @@
 export const MAX_COMPRESSED_FILE_BYTES = 12 * 1024 * 1024;
 export const MAX_COMPRESSED_DURATION_SECONDS = 120;
 export const MAX_DECODE_WORKING_BYTES = 128 * 1024 * 1024;
+export const MIN_DECODER_OVERHEAD_BYTES = 8 * 1024 * 1024;
+export const DECODER_OVERHEAD_RATIO = 0.5;
 
 function findBytes(bytes, signature, maximum = bytes.length) {
   const limit = Math.min(bytes.length - signature.length, maximum);
@@ -112,6 +114,21 @@ export function inspectCompressedLayout(arrayBuffer) {
   return inspectMp3(bytes) || inspectAdts(bytes);
 }
 
+export function estimateCompressedDecodePeakBytes({ encodedBytes, durationSeconds, sampleRate, channels }) {
+  const encodedArrayBufferBytes = Math.ceil(Math.max(0, Number(encodedBytes) || 0));
+  const sampleFrames = Math.ceil(Math.max(0, Number(durationSeconds) || 0) * Math.max(0, Number(sampleRate) || 0));
+  const decodedChannelPcmBytes = sampleFrames * Math.max(0, Number(channels) || 0) * Float32Array.BYTES_PER_ELEMENT;
+  const monoOutputBytes = sampleFrames * Float32Array.BYTES_PER_ELEMENT;
+  const decoderOverheadBytes = Math.max(MIN_DECODER_OVERHEAD_BYTES, Math.ceil(decodedChannelPcmBytes * DECODER_OVERHEAD_RATIO));
+  return {
+    encodedArrayBufferBytes,
+    decodedChannelPcmBytes,
+    monoOutputBytes,
+    decoderOverheadBytes,
+    estimatedPeakBytes: encodedArrayBufferBytes + decodedChannelPcmBytes + monoOutputBytes + decoderOverheadBytes,
+  };
+}
+
 export function assessCompressedUploadSafety({ encodedBytes, durationSeconds, sampleRate, channels, metadataVerified }) {
   if (encodedBytes > MAX_COMPRESSED_FILE_BYTES) return { safe: false, reason: "Compressed audio is limited to 12 MB before decoding on mobile." };
   if (!metadataVerified || !Number.isFinite(sampleRate) || sampleRate < 7350 || sampleRate > 192000 || !Number.isInteger(channels) || channels < 1 || channels > 8) {
@@ -119,11 +136,11 @@ export function assessCompressedUploadSafety({ encodedBytes, durationSeconds, sa
   }
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) return { safe: false, reason: "This compressed file's duration could not be verified safely before decoding." };
   if (durationSeconds > MAX_COMPRESSED_DURATION_SECONDS) return { safe: false, reason: "Compressed audio longer than 2 minutes is not decoded on this device. Trim or convert it to PCM WAV first." };
-  const estimatedWorkingBytes = Math.ceil(durationSeconds * sampleRate * channels * 4 * 1.5);
-  if (estimatedWorkingBytes > MAX_DECODE_WORKING_BYTES) {
-    return { safe: false, reason: "The decoded audio would exceed the mobile memory safety limit. Use a shorter or lower-channel file.", estimatedWorkingBytes };
+  const peakMemory = estimateCompressedDecodePeakBytes({ encodedBytes, durationSeconds, sampleRate, channels });
+  if (peakMemory.estimatedPeakBytes > MAX_DECODE_WORKING_BYTES) {
+    return { safe: false, reason: "Decoding this audio would exceed the 128 MiB peak mobile memory safety limit. Use a shorter, lower-rate, or lower-channel file.", estimatedWorkingBytes: peakMemory.estimatedPeakBytes, ...peakMemory };
   }
-  return { safe: true, estimatedWorkingBytes };
+  return { safe: true, estimatedWorkingBytes: peakMemory.estimatedPeakBytes, ...peakMemory };
 }
 
 export async function preflightCompressedUpload(file, arrayBuffer, readDuration) {
@@ -132,5 +149,5 @@ export async function preflightCompressedUpload(file, arrayBuffer, readDuration)
   const durationSeconds = Number.isFinite(layout.durationSeconds) ? layout.durationSeconds : await readDuration(file);
   const assessment = assessCompressedUploadSafety({ encodedBytes: file.size, durationSeconds, ...layout });
   if (!assessment.safe) throw new Error(assessment.reason);
-  return { ...layout, durationSeconds, estimatedWorkingBytes: assessment.estimatedWorkingBytes };
+  return { ...layout, durationSeconds, estimatedWorkingBytes: assessment.estimatedWorkingBytes, estimatedPeakBytes: assessment.estimatedPeakBytes };
 }
