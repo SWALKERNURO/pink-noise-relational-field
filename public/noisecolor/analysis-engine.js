@@ -1,5 +1,5 @@
-export const APP_VERSION = "0.6.6";
-export const ENGINE_VERSION = "0.6.6";
+export const APP_VERSION = "0.6.7";
+export const ENGINE_VERSION = "0.6.7";
 export const FFT_SIZE = 4096;
 export const WELCH_OVERLAP = 0.5;
 export const DEFAULT_FIT_RANGE = [100, 8000];
@@ -307,37 +307,106 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
   };
 }
 
-export function tonalityDiagnostics(frequencies, power, minFrequency, maxFrequency) {
+export function tonalityDiagnostics(frequencies, power, minFrequency, maxFrequency, fit = null, previousPeakFrequencies = []) {
   const indices = [];
   for (let index = 1; index < frequencies.length; index += 1) {
     if (frequencies[index] >= minFrequency && frequencies[index] <= maxFrequency && power[index] > 0 && Number.isFinite(power[index])) indices.push(index);
   }
-  if (indices.length < 16) return { maxPeakProminenceDb: 0, tonalPowerRatio: 0, prominentPeakCount: 0 };
-  let totalPower = 0;
+  if (indices.length < 16) return { slopeNormalizedFlatness: 0, maxPeakProminenceDb: 0, tonalPowerRatio: 0, prominentPeakCount: 0, persistentPeakCount: 0, harmonicPeakCount: 0, harmonicEvidence: 0, broadbandOccupancy: 0, prominentPeakFrequencies: [] };
+  const residual = new Float64Array(power.length);
+  let residualLogSum = 0;
+  let residualSum = 0;
+  for (const index of indices) {
+    const frequency = frequencies[index];
+    const predicted = Number.isFinite(fit?.intercept) && Number.isFinite(fit?.slope)
+      ? 10 ** (fit.intercept + fit.slope * Math.log10(frequency))
+      : 1;
+    residual[index] = Math.max(power[index] / Math.max(predicted, Number.MIN_VALUE), Number.MIN_VALUE);
+    residualLogSum += Math.log(residual[index]);
+    residualSum += residual[index];
+  }
+  const slopeNormalizedFlatness = Math.exp(residualLogSum / indices.length) / (residualSum / indices.length);
   let tonalExcess = 0;
   let maxPeakProminenceDb = 0;
-  let prominentPeakCount = 0;
   const first = indices[0];
   const last = indices.at(-1);
+  const candidates = [];
   for (const index of indices) {
-    const value = power[index];
-    totalPower += value;
+    const value = residual[index];
+    let localMaximum = true;
+    for (let neighbor = Math.max(first, index - 2); neighbor <= Math.min(last, index + 2); neighbor += 1) {
+      if (neighbor !== index && residual[neighbor] >= value) { localMaximum = false; break; }
+    }
+    if (!localMaximum) continue;
     const neighborhood = [];
-    for (let neighbor = Math.max(first, index - 12); neighbor <= Math.min(last, index + 12); neighbor += 1) {
-      if (Math.abs(neighbor - index) <= 2) continue;
-      neighborhood.push(power[neighbor]);
+    for (let neighbor = Math.max(first, index - 18); neighbor <= Math.min(last, index + 18); neighbor += 1) {
+      if (Math.abs(neighbor - index) <= 3) continue;
+      neighborhood.push(residual[neighbor]);
     }
     const localFloor = median(neighborhood.filter((item) => item > 0 && Number.isFinite(item)));
     if (!(localFloor > 0)) continue;
     const prominenceDb = 10 * Math.log10(value / localFloor);
     maxPeakProminenceDb = Math.max(maxPeakProminenceDb, prominenceDb);
-    if (prominenceDb >= 12) prominentPeakCount += 1;
-    if (prominenceDb >= 8) tonalExcess += Math.max(0, value - localFloor * 10 ** (8 / 10));
+    if (prominenceDb >= 10) candidates.push({ index, frequency: frequencies[index], prominenceDb, localFloor });
   }
+
+  const peaks = [];
+  for (const candidate of candidates.sort((left, right) => right.prominenceDb - left.prominenceDb)) {
+    if (peaks.some((peak) => Math.abs(peak.index - candidate.index) <= 10)) continue;
+    peaks.push(candidate);
+  }
+  peaks.sort((left, right) => left.frequency - right.frequency);
+  for (const peak of peaks) {
+    const threshold = peak.localFloor * 10 ** (8 / 10);
+    let peakExcess = 0;
+    for (let index = Math.max(first, peak.index - 2); index <= Math.min(last, peak.index + 2); index += 1) {
+      peakExcess += Math.max(0, residual[index] - threshold);
+    }
+    peak.excessPower = peakExcess;
+    tonalExcess += peakExcess;
+  }
+
+  const logMin = Math.log10(minFrequency);
+  const logMax = Math.log10(maxFrequency);
+  const bands = Array.from({ length: 24 }, () => []);
+  for (const index of indices) {
+    const band = Math.min(bands.length - 1, Math.floor(((Math.log10(frequencies[index]) - logMin) / (logMax - logMin)) * bands.length));
+    bands[band].push(residual[index]);
+  }
+  const bandLevels = bands.filter((values) => values.length).map((values) => median(values));
+  const maximumBandLevel = Math.max(...bandLevels);
+  const broadbandOccupancy = maximumBandLevel > 0 ? bandLevels.filter((value) => value >= maximumBandLevel / 100).length / bandLevels.length : 0;
+  const prominentPeaks = peaks.filter((peak) => peak.prominenceDb >= 15 && peak.excessPower / residualSum >= 0.001);
+  const prominentPeakCount = prominentPeaks.length;
+  let harmonicPeakCount = 0;
+  for (const seedPeak of prominentPeaks) {
+    for (let divisor = 1; divisor <= 12; divisor += 1) {
+      const fundamentalFrequency = seedPeak.frequency / divisor;
+      if (fundamentalFrequency < 40) continue;
+      let matched = 0;
+      for (const candidate of prominentPeaks) {
+        const harmonic = Math.round(candidate.frequency / fundamentalFrequency);
+        if (harmonic < 1 || harmonic > 12) continue;
+        const tolerance = Math.max(0.018, (2 * (frequencies[1] - frequencies[0])) / candidate.frequency);
+        if (Math.abs(candidate.frequency / fundamentalFrequency - harmonic) / harmonic <= tolerance) matched += 1;
+      }
+      harmonicPeakCount = Math.max(harmonicPeakCount, matched);
+    }
+  }
+  const persistentPeakCount = prominentPeaks.filter((peak) => previousPeakFrequencies.some((frequency) => {
+    const toleranceHz = Math.max(12, frequency * 0.02);
+    return Math.abs(peak.frequency - frequency) <= toleranceHz;
+  })).length;
   return {
+    slopeNormalizedFlatness,
     maxPeakProminenceDb,
-    tonalPowerRatio: totalPower > 0 ? tonalExcess / totalPower : 0,
+    tonalPowerRatio: residualSum > 0 ? Math.min(1, tonalExcess / residualSum) : 0,
     prominentPeakCount,
+    persistentPeakCount,
+    harmonicPeakCount,
+    harmonicEvidence: prominentPeakCount ? Math.min(1, harmonicPeakCount / prominentPeakCount) : 0,
+    broadbandOccupancy,
+    prominentPeakFrequencies: prominentPeaks.map((peak) => peak.frequency),
   };
 }
 
@@ -422,9 +491,25 @@ export function qualityGate({ durationSeconds, input, flatness, fit, tonality = 
   if (durationSeconds < 1.5) return { state: "insufficient", label: "Keep listening…", reliable: false, detail: "More audio is needed for a stable estimate." };
   if (input.dbfs < -58) return { state: "silence", label: "Signal too low", reliable: false, detail: "Raise the signal level or move closer to the source." };
   if (input.clippingRatio > 0.001 || input.nearClipRatio > 0.01 || input.peak >= 0.9999 || input.limitingSuspected) return { state: "clipping", label: "Clipping / limiting suspected", reliable: false, detail: "The waveform appears clipped or aggressively limited; move farther away or reduce gain if possible." };
-  const narrowbandPeak = tonality.maxPeakProminenceDb >= 15 && tonality.tonalPowerRatio >= 0.06;
-  const extremePeak = tonality.maxPeakProminenceDb >= 24 && tonality.tonalPowerRatio >= 0.015;
-  if (flatness < 0.055 || narrowbandPeak || extremePeak) return { state: "tonal", label: "Tonal / non-noise", reliable: false, detail: "Prominent narrowband energy or harmonics do not behave like broadband colored noise." };
+  const normalizedFlatness = Number.isFinite(tonality.slopeNormalizedFlatness) ? tonality.slopeNormalizedFlatness : flatness;
+  const concentratedPeak = tonality.maxPeakProminenceDb >= 18 && tonality.tonalPowerRatio >= 0.3 && normalizedFlatness < 0.72;
+  const dominantPeak = tonality.maxPeakProminenceDb >= 22 && tonality.tonalPowerRatio >= 0.15 && normalizedFlatness < 0.9;
+  const extremePeak = tonality.maxPeakProminenceDb >= 30 && tonality.tonalPowerRatio >= 0.025;
+  const harmonicStructure = tonality.harmonicPeakCount >= 3 && tonality.harmonicEvidence >= 0.55 && tonality.tonalPowerRatio >= 0.02;
+  const multipleNarrowPeaks = tonality.prominentPeakCount >= 4 && tonality.tonalPowerRatio >= 0.06 && normalizedFlatness < 0.72;
+  const noBroadbandBackground = normalizedFlatness < 0.08 && tonality.broadbandOccupancy < 0.55;
+  const tonalReasons = [
+    concentratedPeak && "concentrated narrow peak",
+    dominantPeak && "dominant narrow peak",
+    extremePeak && "extreme peak prominence",
+    harmonicStructure && "harmonic spacing",
+    multipleNarrowPeaks && "multiple narrow peaks",
+    noBroadbandBackground && "insufficient broadband background",
+  ].filter(Boolean);
+  if (tonalReasons.length) {
+    const evidence = `normalized flatness ${normalizedFlatness.toFixed(3)}, peak ${Number(tonality.maxPeakProminenceDb || 0).toFixed(1)} dB, tonal power ${(100 * Number(tonality.tonalPowerRatio || 0)).toFixed(1)}%, peaks ${tonality.prominentPeakCount || 0}, persistent ${tonality.persistentPeakCount || 0}, harmonic matches ${tonality.harmonicPeakCount || 0}`;
+    return { state: "tonal", label: "Tonal / non-noise", reliable: false, detail: `Tonal evidence: ${tonalReasons.join(", ")} (${evidence}).` };
+  }
   const fixedHalfMismatch = modelAdequacy.segmentedSlopeDelta > 0.75 && modelAdequacy.logBinnedRmseDb > 0.85;
   const rollingBreakpointMismatch = modelAdequacy.maxBreakpointSlopeDelta >= 0.55
     && modelAdequacy.piecewiseImprovementDb >= 0.012
@@ -510,7 +595,7 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
   const fit = fitPowerLaw(psd.frequencies, psd.power, fitRange[0], maxFrequency);
   const input = calculateInputMetrics(samples);
   const flatness = spectralFlatness(psd.frequencies, psd.power, fitRange[0], maxFrequency);
-  const tonality = tonalityDiagnostics(psd.frequencies, psd.power, fitRange[0], maxFrequency);
+  const tonality = tonalityDiagnostics(psd.frequencies, psd.power, fitRange[0], maxFrequency, fit, options.previousProminentPeakFrequencies || []);
   const modelAdequacy = modelAdequacyDiagnostics(psd.frequencies, psd.power, fitRange[0], maxFrequency);
   const durationSeconds = samples.length / sampleRate;
   const quality = qualityGate({ durationSeconds, input, flatness, fit, tonality, modelAdequacy, temporalSd: options.temporalSd || 0 });
@@ -540,6 +625,7 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     rmseDb: fit.rmseDb,
     maeDb: fit.maeDb,
     spectralFlatness: flatness,
+    slopeNormalizedFlatness: tonality.slopeNormalizedFlatness,
     rms: input.rms,
     dbfs: input.dbfs,
     peak: input.peak,
@@ -554,6 +640,11 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     maxPeakProminenceDb: tonality.maxPeakProminenceDb,
     tonalPowerRatio: tonality.tonalPowerRatio,
     prominentPeakCount: tonality.prominentPeakCount,
+    persistentPeakCount: tonality.persistentPeakCount,
+    harmonicPeakCount: tonality.harmonicPeakCount,
+    harmonicEvidence: tonality.harmonicEvidence,
+    broadbandOccupancy: tonality.broadbandOccupancy,
+    prominentPeakFrequencies: tonality.prominentPeakFrequencies,
     logBinnedBeta: modelAdequacy.logBinnedBeta,
     logBinnedRmseDb: modelAdequacy.logBinnedRmseDb,
     lowBandBeta: modelAdequacy.lowBandBeta,
@@ -824,7 +915,16 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
     input: { rms: overall.rms, dbfs: overall.dbfs, clippingRatio: overall.clippingRatio, nearClipRatio: overall.nearClipRatio, peak: overall.peak, limitingSuspected: overall.limitingSuspected, nonFiniteRatio: overall.nonFiniteRatio },
     flatness: overall.spectralFlatness,
     fit: { beta: overall.beta, rmseDb: overall.rmseDb },
-    tonality: { maxPeakProminenceDb: overall.maxPeakProminenceDb, tonalPowerRatio: overall.tonalPowerRatio },
+    tonality: {
+      slopeNormalizedFlatness: overall.slopeNormalizedFlatness,
+      maxPeakProminenceDb: overall.maxPeakProminenceDb,
+      tonalPowerRatio: overall.tonalPowerRatio,
+      prominentPeakCount: overall.prominentPeakCount,
+      persistentPeakCount: overall.persistentPeakCount,
+      harmonicPeakCount: overall.harmonicPeakCount,
+      harmonicEvidence: overall.harmonicEvidence,
+      broadbandOccupancy: overall.broadbandOccupancy,
+    },
     modelAdequacy: {
       segmentedSlopeDelta: overall.segmentedSlopeDelta,
       logBinnedRmseDb: overall.logBinnedRmseDb,

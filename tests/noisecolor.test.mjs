@@ -49,6 +49,64 @@ function coloredNoise(beta, { sampleRate = 16000, size = 65536, seed = 1, rms = 
   return Float32Array.from(real, (sample) => (sample / currentRms) * rms);
 }
 
+function frequencyShapedColoredNoise(beta, { sampleRate = 16000, size = 65536, seed = 1, rms = 0.16, responseDb = () => 0 } = {}) {
+  const random = randomGenerator(seed);
+  const real = new Float64Array(size);
+  const imaginary = new Float64Array(size);
+  for (let bin = 1; bin < size / 2; bin += 1) {
+    const frequency = (bin * sampleRate) / size;
+    const magnitude = frequency ** (-beta / 2) * 10 ** (responseDb(frequency) / 20);
+    const phase = random() * 2 * Math.PI;
+    real[bin] = magnitude * Math.cos(phase);
+    imaginary[bin] = magnitude * Math.sin(phase);
+    real[size - bin] = real[bin];
+    imaginary[size - bin] = -imaginary[bin];
+  }
+  fftInPlace(real, imaginary, true);
+  const currentRms = Math.sqrt(real.reduce((sum, sample) => sum + sample * sample, 0) / size);
+  return Float32Array.from(real, (sample) => (sample / currentRms) * rms);
+}
+
+function addSinusoids(samples, tones, sampleRate = 16000) {
+  return Float32Array.from(samples, (sample, index) => sample + tones.reduce((sum, [frequency, amplitude, phase = 0]) => sum + amplitude * Math.sin((2 * Math.PI * frequency * index) / sampleRate + phase), 0));
+}
+
+function acousticResonanceResponse(frequency) {
+  return [[240, 18, 0.025], [780, 18, 0.025], [2100, 18, 0.025]].reduce((sum, [center, gainDb, widthOctaves]) => (
+    sum + gainDb * Math.exp(-0.5 * (Math.log2(frequency / center) / widthOctaves) ** 2)
+  ), 0);
+}
+
+function plausibleTransducerEq(frequency) {
+  return 0.6 * Math.log2(frequency / 1000);
+}
+
+function legacyTonalityDecision(result) {
+  const frequencies = result.psd.frequencies;
+  const power = result.psd.power;
+  const indices = frequencies.map((frequency, index) => ({ frequency, index })).filter(({ frequency, index }) => frequency >= result.fitRange[0] && frequency <= result.fitRange[1] && power[index] > 0).map(({ index }) => index);
+  let totalPower = 0;
+  let tonalExcess = 0;
+  let maximumProminenceDb = 0;
+  const first = indices[0];
+  const last = indices.at(-1);
+  for (const index of indices) {
+    totalPower += power[index];
+    const neighborhood = [];
+    for (let neighbor = Math.max(first, index - 12); neighbor <= Math.min(last, index + 12); neighbor += 1) {
+      if (Math.abs(neighbor - index) > 2) neighborhood.push(power[neighbor]);
+    }
+    neighborhood.sort((left, right) => left - right);
+    const middle = Math.floor(neighborhood.length / 2);
+    const floor = neighborhood.length % 2 ? neighborhood[middle] : (neighborhood[middle - 1] + neighborhood[middle]) / 2;
+    const prominenceDb = 10 * Math.log10(power[index] / floor);
+    maximumProminenceDb = Math.max(maximumProminenceDb, prominenceDb);
+    if (prominenceDb >= 8) tonalExcess += Math.max(0, power[index] - floor * 10 ** 0.8);
+  }
+  const tonalPowerRatio = tonalExcess / totalPower;
+  return result.spectralFlatness < 0.055 || (maximumProminenceDb >= 15 && tonalPowerRatio >= 0.06) || (maximumProminenceDb >= 24 && tonalPowerRatio >= 0.015);
+}
+
 function sineWave(frequency, { sampleRate = 16000, seconds = 4, amplitude = 0.3 } = {}) {
   return Float32Array.from({ length: Math.round(sampleRate * seconds) }, (_, index) => amplitude * Math.sin((2 * Math.PI * frequency * index) / sampleRate));
 }
@@ -147,6 +205,62 @@ test("strong tonal mixtures cannot receive a confident broadband color label", (
   assert.equal(result.reliable, false);
   assert.ok(result.maxPeakProminenceDb >= 15);
   assert.ok(result.tonalPowerRatio >= 0.06);
+});
+
+test("slope-normalized tonality preserves clean and transducer-shaped white, pink, and brown noise", () => {
+  const expected = [[0, "white"], [1, "pink"], [2, "brown"]];
+  for (const [beta, state] of expected) {
+    for (const [fixture, samples] of [
+      ["clean", coloredNoise(beta, { seed: 610 + beta })],
+      ["speaker/microphone EQ", frequencyShapedColoredNoise(beta, { seed: 620 + beta, responseDb: plausibleTransducerEq })],
+    ]) {
+      const result = analyzeSamples(samples, 16000, analysisOptions);
+      assert.equal(result.state, state, `${fixture} β ${beta} was ${result.classification}: ${result.qualityDetail}`);
+      assert.ok(result.slopeNormalizedFlatness > 0.9, `${fixture} β ${beta} normalized flatness ${result.slopeNormalizedFlatness}`);
+      assert.equal(result.reliable, true);
+    }
+  }
+});
+
+test("realistic non-harmonic acoustic resonances no longer trigger the legacy tonal false positive", () => {
+  const expected = [[0, "white"], [1, "pink"], [2, "brown"]];
+  for (const [beta, state] of expected) {
+    const samples = frequencyShapedColoredNoise(beta, { seed: 700 + beta, responseDb: acousticResonanceResponse });
+    const first = analyzeSamples(samples, 16000, analysisOptions);
+    assert.equal(legacyTonalityDecision(first), true, `fixture β ${beta} did not reproduce the legacy tonal decision`);
+    assert.equal(first.state, state, `resonant β ${beta} was ${first.classification}: ${first.qualityDetail}`);
+    assert.ok(first.prominentPeakCount >= 2);
+    assert.ok(first.slopeNormalizedFlatness > first.spectralFlatness);
+    const repeated = analyzeSamples(samples, 16000, { ...analysisOptions, previousProminentPeakFrequencies: first.prominentPeakFrequencies });
+    assert.ok(repeated.persistentPeakCount >= 2, `expected persistent room peaks for β ${beta}`);
+    assert.equal(repeated.state, state, "persistent non-harmonic room resonances must remain broadband noise");
+  }
+});
+
+test("weak isolated tones preserve broadband colors while strong isolated tones are rejected", () => {
+  const expected = [[0, "white"], [1, "pink"], [2, "brown"]];
+  for (const [beta, state] of expected) {
+    const weak = analyzeSamples(addSinusoids(coloredNoise(beta, { seed: 800 + beta, rms: 0.16 }), [[1000, 0.003]]), 16000, analysisOptions);
+    assert.equal(weak.state, state, `weak tone over β ${beta} was ${weak.classification}`);
+    for (const frequency of [220, 1000, 2300]) {
+      const strong = analyzeSamples(addSinusoids(coloredNoise(beta, { seed: 810 + beta, rms: 0.1 }), [[frequency, 0.16]]), 16000, analysisOptions);
+      assert.equal(strong.state, "tonal", `strong ${frequency} Hz tone over β ${beta} was ${strong.classification}`);
+      assert.ok(strong.tonalPowerRatio > 0.15);
+    }
+  }
+});
+
+test("pure, harmonic, and music-like tones retain conservative non-noise classifications", () => {
+  const pure = analyzeSamples(sineWave(997, { amplitude: 0.25 }), 16000, analysisOptions);
+  const harmonicTones = [[220, 0.14], [440, 0.1], [660, 0.08], [880, 0.06], [1100, 0.05], [1320, 0.04]];
+  const harmonic = analyzeSamples(addSinusoids(new Float32Array(65536), harmonicTones), 16000, analysisOptions);
+  const musicLike = analyzeSamples(addSinusoids(coloredNoise(0, { seed: 899, rms: 0.025 }), harmonicTones.map(([frequency, amplitude], index) => [frequency, amplitude * 0.75, index * 0.37])), 16000, analysisOptions);
+  assert.equal(pure.state, "tonal");
+  assert.match(pure.qualityDetail, /Tonal evidence:/);
+  assert.equal(harmonic.state, "tonal");
+  assert.ok(harmonic.harmonicPeakCount >= 3);
+  assert.ok(["tonal", "mixed"].includes(musicLike.state), `music-like fixture was ${musicLike.classification}`);
+  assert.equal(musicLike.reliable, false);
 });
 
 test("two-regime spectra fail the single-power-law adequacy gate", () => {
@@ -613,6 +727,10 @@ test("NoiseColor PWA paths and mobile lifecycle contracts stay scoped", async ()
   assert.match(serviceWorker, /microphone-startup\.js/);
   assert.match(html, /id="historyPageStatus" role="status" aria-live="polite"/);
   assert.match(app, /state\.workerBusy/);
+  assert.match(app, /Slope-normalized flatness/);
+  assert.match(app, /Persistent peaks/);
+  assert.match(app, /Harmonic evidence/);
+  assert.match(app, /Broadband occupancy/);
   assert.match(html, /id="clearButton"/);
   assert.match(html, /role="tabpanel"/);
   assert.match(html, /aria-controls="panelSpectrum"/);

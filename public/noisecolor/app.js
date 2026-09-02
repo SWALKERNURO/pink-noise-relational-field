@@ -7,13 +7,13 @@ import {
   WELCH_OVERLAP,
   SessionAccumulator,
   summarize,
-} from "./analysis-engine.js?v=0.6.6";
-import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.6";
-import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.6";
-import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.6";
-import { MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow } from "./live-runtime.js?v=0.6.6";
-import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.6";
-import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.6";
+} from "./analysis-engine.js?v=0.6.7";
+import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.7";
+import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.7";
+import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.7";
+import { MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow } from "./live-runtime.js?v=0.6.7";
+import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.7";
+import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.7";
 
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 32 * 1024 * 1024;
@@ -116,6 +116,7 @@ function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) 
     sourceFilename,
     calibrationProfile: profile,
     temporalSd: sourceType === "live" ? summarize(state.observations.slice(-10).filter((item) => item.reliable).map((item) => item.beta)).sd || 0 : 0,
+    previousProminentPeakFrequencies: sourceType === "live" ? state.latestResult?.prominentPeakFrequencies || [] : [],
     maxWelchSegments: sourceType === "live" ? 48 : 96,
     scalarGainDb: Number(elements.scalarGain.value) || 0,
     calibrationRouteKey: state.inputRoute,
@@ -127,7 +128,7 @@ function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) 
 
 function ensureWorker() {
   if (state.worker) return state.worker;
-  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.6", import.meta.url), { type: "module" });
+  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.7", import.meta.url), { type: "module" });
   state.worker.addEventListener("message", (event) => {
     const request = state.workerRequests.get(event.data.id);
     if (!request) return;
@@ -416,7 +417,7 @@ async function startMicrophone({ recording = false } = {}) {
 
       let captureNode;
       if (audioContext.audioWorklet) {
-        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.6");
+        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.7");
         startup.checkpoint();
         captureNode = new AudioWorkletNode(audioContext, "noisecolor-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
         captureNode.port.onmessage = (event) => captureSamples(event.data);
@@ -1003,7 +1004,8 @@ function resultMarkup(result) {
       <div><span>β mean ± SD</span><strong>${formatNumber(result.temporalBetaMean ?? result.beta)} ± ${formatNumber(result.temporalBetaSd)}</strong></div>
       <div><span>Fit residual</span><strong>${formatNumber(result.rmseDb, 2, " dB")}</strong></div>
       <div><span>R²</span><strong>${formatNumber(result.r2, 3)}</strong></div>
-      <div><span>Flatness</span><strong>${formatNumber(result.spectralFlatness, 3)}</strong></div>
+      <div><span>Raw flatness</span><strong>${formatNumber(result.spectralFlatness, 3)}</strong></div>
+      <div><span>Slope-normalized flatness</span><strong>${formatNumber(result.slopeNormalizedFlatness, 3)}</strong></div>
       <div><span>Duration</span><strong>${formatDuration(result.durationSeconds)}</strong></div>
       ${result.analysisTruncated ? `<div><span>Source duration</span><strong>${formatDuration(result.sourceDurationSeconds)} · final window</strong></div>` : ""}
       <div><span>Sample rate</span><strong>${escapeHtml(result.sampleRate)} Hz</strong></div>
@@ -1049,13 +1051,14 @@ function exportCsv(result) {
     ["Welch segments used", result.welchSegments], ["Welch segments available", result.welchAvailableSegments],
     ["fit min Hz", result.fitRange?.[0]], ["fit max Hz", result.fitRange?.[1]], ["analysis mode", result.analysisMode],
     ["analysis window seconds", result.analysisWindowSeconds], ["beta", result.beta], ["raw slope", result.rawSlope],
-    ["R squared", result.r2], ["RMSE dB", result.rmseDb], ["MAE dB", result.maeDb], ["spectral flatness", result.spectralFlatness],
+    ["R squared", result.r2], ["RMSE dB", result.rmseDb], ["MAE dB", result.maeDb], ["spectral flatness", result.spectralFlatness], ["slope-normalized flatness", result.slopeNormalizedFlatness],
     ["temporal beta mean", result.temporalBetaMean], ["temporal beta SD", result.temporalBetaSd], ["canonical color", result.canonicalColor],
     ["canonical distance", result.canonicalDistance], ["classification", result.classification], ["confidence", result.confidence],
     ["reliable", result.reliable], ["calibration profile", result.calibrationProfile || "uncorrected"], ["scalar gain context dB", result.scalarGainDb],
     ["calibration details", result.calibration ? JSON.stringify(result.calibration) : ""], ["input route", result.inputRouteLabel],
     ["microphone settings", result.microphoneSettings ? JSON.stringify(result.microphoneSettings) : ""],
-    ["peak prominence dB", result.maxPeakProminenceDb], ["tonal power ratio", result.tonalPowerRatio],
+    ["peak prominence dB", result.maxPeakProminenceDb], ["tonal power ratio", result.tonalPowerRatio], ["prominent peak count", result.prominentPeakCount], ["persistent peak count", result.persistentPeakCount],
+    ["harmonic peak count", result.harmonicPeakCount], ["harmonic evidence", result.harmonicEvidence], ["broadband occupancy", result.broadbandOccupancy], ["prominent peak frequencies Hz", result.prominentPeakFrequencies?.join(" | ")],
     ["low-band beta", result.lowBandBeta], ["high-band beta", result.highBandBeta], ["segmented slope delta", result.segmentedSlopeDelta],
     ["maximum breakpoint slope delta", result.maxBreakpointSlopeDelta], ["strongest breakpoint Hz", result.strongestBreakpointFrequency], ["piecewise fit improvement dB", result.piecewiseImprovementDb],
     ["near-clip ratio", result.nearClipRatio], ["plateau ratio", result.plateauRatio], ["crest factor", result.crestFactor], ["amplitude kurtosis", result.amplitudeKurtosis], ["edge density ratio", result.edgeDensityRatio], ["limiting suspected", result.limitingSuspected],
@@ -1253,13 +1256,13 @@ function renderAdvanced(result) {
   }
   const diagnostics = [
     ["β", formatNumber(result.beta)], ["R²", formatNumber(result.r2, 3)], ["RMSE", formatNumber(result.rmseDb, 2, " dB")], ["MAE", formatNumber(result.maeDb, 2, " dB")],
-    ["Flatness", formatNumber(result.spectralFlatness, 3)], ["Level", formatNumber(result.dbfs, 1, " dBFS")], ["Clipping", formatNumber(result.clippingRatio * 100, 3, "%")], ["Near clip", formatNumber(result.nearClipRatio * 100, 2, "%")],
-    ["Crest factor", formatNumber(result.crestFactor, 2)], ["Amplitude kurtosis", formatNumber(result.amplitudeKurtosis, 2)], ["Edge density", formatNumber(result.edgeDensityRatio * 100, 1, "%")], ["Peak prominence", formatNumber(result.maxPeakProminenceDb, 1, " dB")], ["Tonal power", formatNumber(result.tonalPowerRatio * 100, 1, "%")], ["Breakpoint Δβ", formatNumber(result.maxBreakpointSlopeDelta, 2)],
+    ["Raw flatness", formatNumber(result.spectralFlatness, 3)], ["Slope-normalized flatness", formatNumber(result.slopeNormalizedFlatness, 3)], ["Broadband occupancy", formatNumber(result.broadbandOccupancy * 100, 0, "%")], ["Level", formatNumber(result.dbfs, 1, " dBFS")], ["Clipping", formatNumber(result.clippingRatio * 100, 3, "%")], ["Near clip", formatNumber(result.nearClipRatio * 100, 2, "%")],
+    ["Crest factor", formatNumber(result.crestFactor, 2)], ["Amplitude kurtosis", formatNumber(result.amplitudeKurtosis, 2)], ["Edge density", formatNumber(result.edgeDensityRatio * 100, 1, "%")], ["Peak prominence", formatNumber(result.maxPeakProminenceDb, 1, " dB")], ["Tonal power", formatNumber(result.tonalPowerRatio * 100, 1, "%")], ["Prominent peaks", `${result.prominentPeakCount || 0}`], ["Persistent peaks", `${result.persistentPeakCount || 0}`], ["Harmonic matches", `${result.harmonicPeakCount || 0}`], ["Harmonic evidence", formatNumber(result.harmonicEvidence, 2)], ["Breakpoint Δβ", formatNumber(result.maxBreakpointSlopeDelta, 2)],
     ["Fit range", `${result.fitRange?.[0]}–${Math.round(result.fitRange?.[1] || 0)} Hz`],
     ["Sample rate", `${result.sampleRate} Hz`], ["Welch", `${result.fftSize} FFT · ${result.welchOverlap * 100}% overlap`], ["Correction", result.calibrationProfile || "Uncorrected"], ["Engine", `v${result.analysisEngineVersion}`],
   ];
   elements.diagnosticGrid.innerHTML = diagnostics.map(([label, value]) => `<div><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong></div>`).join("");
-  elements.measuredCopy.textContent = `β ${formatNumber(result.beta)}, residual ${formatNumber(result.rmseDb, 2, " dB")}, R² ${formatNumber(result.r2, 3)}, flatness ${formatNumber(result.spectralFlatness, 3)}.`;
+  elements.measuredCopy.textContent = `β ${formatNumber(result.beta)}, residual ${formatNumber(result.rmseDb, 2, " dB")}, R² ${formatNumber(result.r2, 3)}, slope-normalized flatness ${formatNumber(result.slopeNormalizedFlatness, 3)}.`;
   elements.interpretationCopy.textContent = result.qualityDetail;
   elements.spectrumNote.textContent = `${result.corrected ? `Corrected with ${result.calibrationProfile}` : "Uncorrected continuous PSD"}. β is fitted from ${result.fitRange[0]}–${Math.round(result.fitRange[1])} Hz without A weighting or third-octave aggregation.`;
 }
