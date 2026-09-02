@@ -14,7 +14,7 @@
   <link rel="manifest" href="./manifest.webmanifest" />
   <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
   <link rel="icon" href="./icons/icon-192.png" />
-  <link rel="stylesheet" href="./styles.css?v=0.6.8-recovery.2" />
+  <link rel="stylesheet" href="./styles.css?v=0.6.8-recovery.3" />
   <title>NoiseColor — Live spectral structure</title>
 </head>
 <body>
@@ -59,6 +59,27 @@
           <span id="captureInterruptionText" role="status"></span>
           <button id="resumeCaptureButton" type="button">Resume capture</button>
         </div>
+
+        <section id="microphoneFailure" class="microphone-failure" aria-labelledby="microphoneFailureTitle" hidden>
+          <h2 id="microphoneFailureTitle" tabindex="-1">Microphone unavailable</h2>
+          <p id="microphoneFailureText" role="status"></p>
+          <div id="iosMicrophoneActions" hidden>
+            <button id="openSafariButton" class="primary-button" type="button">Open NoiseColor in Safari</button>
+            <button id="reinstallMicrophoneButton" class="secondary-button" type="button">How to reinstall for microphone access</button>
+            <div id="safariFallback" hidden>
+              <p>If Safari did not open, open Safari yourself and paste this link into its address bar. iOS chooses the external browser; NoiseColor cannot force Safari. Do not relaunch the standalone app.</p>
+              <a id="safariCanonicalLink" target="_blank" rel="noopener noreferrer"></a>
+              <button id="copySafariLinkButton" class="secondary-button" type="button">Copy Link</button>
+              <p id="safariLinkStatus" role="status"></p>
+            </div>
+            <p>A permission denial can also reflect your browser settings. No permission is bypassed. Upload, History and Advanced remain available.</p>
+          </div>
+          <div class="result-actions">
+            <button id="retryMicrophoneButton" type="button">Retry Microphone</button>
+            <button id="exportStartupDiagnosticButton" type="button">Export diagnostic bundle</button>
+          </div>
+          <p class="chart-note">Startup context only, with sanitized errors. No raw audio, device identifiers or scientific measurement.</p>
+        </section>
 
         <section id="liveView" class="view active" data-view-panel="live" aria-labelledby="liveTitle">
           <div class="live-heading">
@@ -213,7 +234,7 @@
         <section><span class="rail-number">01</span><h2>Measured</h2><div id="railMeasured">No live measurement yet.</div></section>
         <section><span class="rail-number">02</span><h2>Interpretation</h2><p id="railInterpretation">A canonical color appears only after the stable estimator passes silence, clipping, tonal, stability, and fit-quality gates.</p></section>
         <section><span class="rail-number dim">03</span><h2>Question</h2><p>Is the current sound genuinely broadband and scale-like, or is one β hiding tones and change over time?</p></section>
-        <footer><strong>PRIVATE BY DESIGN</strong><p>Audio is analyzed locally and is not uploaded to a server.</p><small id="versionLabel">NoiseColor v0.6.8-recovery.2</small></footer>
+        <footer><strong>PRIVATE BY DESIGN</strong><p>Audio is analyzed locally and is not uploaded to a server.</p><small id="versionLabel">NoiseColor v0.6.8-recovery.3</small></footer>
       </aside>
     </main>
 
@@ -233,6 +254,6 @@
   </div>
 
   <noscript>NoiseColor requires JavaScript for local audio analysis.</noscript>
-  <script type="module" src="./app.js?v=0.6.8-recovery.2"></script>
+  <script type="module" src="./app.js?v=0.6.8-recovery.3"></script>
 </body>
 </html>

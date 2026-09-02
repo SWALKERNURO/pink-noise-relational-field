@@ -2,9 +2,13 @@ export function isStandalone() {
   return window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone === true;
 }
 
+export function isIosDevice(navigatorLike = navigator) {
+  return /iPad|iPhone|iPod/.test(navigatorLike.userAgent || "") || (navigatorLike.platform === "MacIntel" && navigatorLike.maxTouchPoints > 1);
+}
+
 export function isIosSafari() {
   const userAgent = navigator.userAgent;
-  const ios = /iPad|iPhone|iPod/.test(userAgent) || (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+  const ios = isIosDevice();
   const webkit = /WebKit/.test(userAgent);
   const otherIosBrowser = /CriOS|FxiOS|EdgiOS|OPiOS/.test(userAgent);
   return ios && webkit && !otherIosBrowser;
@@ -13,7 +17,7 @@ export function isIosSafari() {
 export function platformInstallHint() {
   const forced = new URLSearchParams(location.search).get("install");
   if (forced === "ios" || forced === "android") return forced;
-  if (isIosSafari()) return "ios";
+  if (isIosDevice()) return "ios";
   if (/Android/i.test(navigator.userAgent)) return "android";
   return "desktop";
 }

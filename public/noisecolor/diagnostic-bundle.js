@@ -1,5 +1,6 @@
-import { fitPowerLaw, spectralFlatness, tonalityDiagnostics, modelAdequacyDiagnostics } from "./analysis-engine.js?v=0.6.8-recovery.2";
-import { sanitizeAudioSettings, sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.2";
+import { APP_VERSION, ENGINE_VERSION, fitPowerLaw, spectralFlatness, tonalityDiagnostics, modelAdequacyDiagnostics } from "./analysis-engine.js?v=0.6.8-recovery.3";
+import { sanitizeAudioSettings, sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.3";
+import { sanitizeStartupFailure } from "./microphone-compatibility.js?v=0.6.8-recovery.3";
 
 export const DIAGNOSTIC_SCHEMA = "noisecolor-diagnostic/1";
 const scalar = (value) => value == null || ["number", "boolean", "string"].includes(typeof value);
@@ -28,7 +29,16 @@ export function canExportDiagnostic(result) {
 
 // Closed schema: never spread a result, options, track, calibration profile,
 // session or browser object into the export. This is statistics + PSD, not PCM.
-export function createDiagnosticBundle(result, { observations, session, interruptionEvents = [] } = {}) {
+export function createDiagnosticBundle(result, { observations, session, interruptionEvents = [], startupFailure = null } = {}) {
+  if (!result && startupFailure) {
+    const failure = sanitizeStartupFailure(startupFailure);
+    return { schema: DIAGNOSTIC_SCHEMA, kind: "microphone-startup-failure", appVersion: APP_VERSION, engineVersion: ENGINE_VERSION,
+      measurementTimestamp: null, exportTimestamp: new Date().toISOString(),
+      privacy: { localOnly: true, rawAudioIncluded: false, identifiersIncluded: false, filenamesIncluded: false },
+      acquisition: { path: failure.acquisitionMode, audioTrackSettings: failure.audioTrackSettings },
+      rawMeasurement: null, psd: null,
+      capture: { startupFailure: failure, limitation: "Startup failed; no scientific measurement or PCM is included. This error cannot distinguish user denial from an iOS/platform restriction." } };
+  }
   if (!canExportDiagnostic(result)) throw new Error("Exact measurement PSD/configuration unavailable. Analyze again; compact history and session means cannot reconstruct it.");
   const core = result.measurement;
   const model = core.modelAdequacy;

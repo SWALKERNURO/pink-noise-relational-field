@@ -7,18 +7,19 @@ import {
   WELCH_OVERLAP,
   SessionAccumulator,
   summarize,
-} from "./analysis-engine.js?v=0.6.8-recovery.2";
-import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.8-recovery.2";
-import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.8-recovery.2";
-import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.8-recovery.2";
-import { capturePcm, CaptureContinuity, liveWindowProvenance, LiveAnalysisScheduler, MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow, sessionSignalPercentages } from "./live-runtime.js?v=0.6.8-recovery.2";
-import { PcmTrace, PcmMeter } from "./pcm-diagnostics.js?v=0.6.8-recovery.2";
-import { mixToMono, decodePcmWavTail } from "./pcm-input.js?v=0.6.8-recovery.2";
-import { PRIMARY_ANALYSIS_CONFIG } from "./analysis-pipeline.js?v=0.6.8-recovery.2";
-import { browserDiagnosticInfo, canExportDiagnostic, createDiagnosticBundle } from "./diagnostic-bundle.js?v=0.6.8-recovery.2";
-import { sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.2";
-import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.8-recovery.2";
-import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.8-recovery.2";
+} from "./analysis-engine.js?v=0.6.8-recovery.3";
+import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.8-recovery.3";
+import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.8-recovery.3";
+import { isIosDevice, isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.8-recovery.3";
+import { canonicalAppUrl, isIosStandaloneDenial, microphoneEnvironment, microphoneStartupFailure, openSafariFromGesture } from "./microphone-compatibility.js?v=0.6.8-recovery.3";
+import { capturePcm, CaptureContinuity, liveWindowProvenance, LiveAnalysisScheduler, MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow, sessionSignalPercentages } from "./live-runtime.js?v=0.6.8-recovery.3";
+import { PcmTrace, PcmMeter } from "./pcm-diagnostics.js?v=0.6.8-recovery.3";
+import { mixToMono, decodePcmWavTail } from "./pcm-input.js?v=0.6.8-recovery.3";
+import { PRIMARY_ANALYSIS_CONFIG } from "./analysis-pipeline.js?v=0.6.8-recovery.3";
+import { browserDiagnosticInfo, canExportDiagnostic, createDiagnosticBundle } from "./diagnostic-bundle.js?v=0.6.8-recovery.3";
+import { sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.3";
+import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.8-recovery.3";
+import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.8-recovery.3";
 
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 32 * 1024 * 1024;
@@ -37,6 +38,8 @@ const elements = Object.fromEntries([
   "installInstructions", "privacyChip", "summaryTimeline", "betaDataSummary", "spectrumDataSummary", "spectrogramDataSummary",
   "exportLiveDiagnosticButton", "exportDiagnosticButton", "diagnosticExportStatus",
   "captureInterruption", "captureInterruptionText", "resumeCaptureButton",
+  "microphoneFailure", "microphoneFailureTitle", "microphoneFailureText", "iosMicrophoneActions", "openSafariButton", "retryMicrophoneButton",
+  "reinstallMicrophoneButton", "safariFallback", "safariCanonicalLink", "copySafariLinkButton", "safariLinkStatus", "exportStartupDiagnosticButton",
 ].map((id) => [id, document.getElementById(id)]));
 
 const stateMachine = new ColorStateMachine();
@@ -99,6 +102,7 @@ const state = {
   analysisGeneration: 0,
   recordingAnalysisGeneration: 0,
   microphoneStartupMode: null,
+  microphoneFailure: null,
 };
 
 function modeConfig() {
@@ -155,7 +159,7 @@ function recentStableObservations() {
 
 function ensureWorker() {
   if (state.worker) return state.worker;
-  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.8-recovery.2", import.meta.url), { type: "module" });
+  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.8-recovery.3", import.meta.url), { type: "module" });
   state.worker.addEventListener("message", (event) => {
     const request = state.workerRequests.get(event.data.id);
     if (!request) return;
@@ -215,6 +219,7 @@ function cancelPendingAnalysis() {
 
 function setView(view) {
   state.currentView = view;
+  updateMicrophoneFailureView();
   document.querySelectorAll("[data-view-panel]").forEach((panel) => {
     const active = panel.dataset.viewPanel === view;
     panel.hidden = !active;
@@ -318,6 +323,7 @@ function clearAnalysisResults({ resetStatuses = true } = {}) {
 }
 
 async function resetApplication() {
+  clearMicrophoneFailure();
   if (state.recording) {
     state.recording = false;
     const recorder = state.recorder;
@@ -428,22 +434,28 @@ async function resumeAudioContext(audioContext, timeoutMs = AUDIO_CONTEXT_START_
 }
 
 async function startMicrophone({ recording = false } = {}) {
-  if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access is not supported in this browser.");
   if (state.recording && !recording) throw new Error("Stop the current recording before starting Live Analysis.");
   if (microphoneStartup.pending) throw new MicrophoneStartupError("A microphone startup attempt is already in progress.", "MICROPHONE_STARTUP_IN_PROGRESS");
+  clearMicrophoneFailure();
   if (state.stream) await stopMicrophone({ preserveSummary: false, silent: true });
+  let failureStage = "startup";
+  let obtainedTrack = null;
   const constraints = {
     audio: { channelCount: { ideal: 1 }, echoCancellation: false, noiseSuppression: false, autoGainControl: false },
     video: false,
   };
   try {
+    if (!navigator.mediaDevices?.getUserMedia) throw new Error("Microphone access is not supported in this browser.");
     return await microphoneStartup.run(async (startup) => {
       state.microphoneStartupMode = recording ? "recording" : "live";
       setMicrophoneStartupControls(recording, true);
+      failureStage = "get-user-media";
       const stream = await navigator.mediaDevices.getUserMedia(constraints);
       await startup.track(stream, (resource) => resource.getTracks().forEach((item) => item.stop()));
       startup.checkpoint();
       const track = stream.getAudioTracks()[0];
+      obtainedTrack = track || null;
+      failureStage = "audio-setup";
       if (!track) throw new Error("No microphone audio track is available.");
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
       if (!AudioContextClass) throw new Error("Audio processing is not supported in this browser.");
@@ -469,7 +481,7 @@ async function startMicrophone({ recording = false } = {}) {
 
       let captureNode;
       if (audioContext.audioWorklet) {
-        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.8-recovery.2");
+        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.8-recovery.3");
         startup.checkpoint();
         captureNode = new AudioWorkletNode(audioContext, "noisecolor-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 1, channelCountMode: "explicit", channelInterpretation: "speakers" });
         state.captureTransport = "AudioWorklet / explicit mono input";
@@ -567,6 +579,14 @@ async function startMicrophone({ recording = false } = {}) {
     });
   } catch (error) {
     setMicrophoneStartupControls(recording, false, false);
+    if (!isMicrophoneStartupCancellation(error) && !isMicrophoneStartupConflict(error)) {
+      let settings = null;
+      try { settings = obtainedTrack?.getSettings?.() || null; } catch { /* settings are optional diagnostics */ }
+      state.microphoneFailure = microphoneStartupFailure(error, {
+        ...microphoneEnvironment(window, navigator), acquisitionMode: recording ? "recording" : "live", stage: failureStage,
+        trackObtained: Boolean(obtainedTrack), audioTrackSettings: settings,
+      });
+    }
     throw error;
   } finally {
     state.microphoneStartupMode = null;
@@ -877,6 +897,7 @@ function chooseRecordingMimeType() {
 }
 
 async function startRecording() {
+  if (!microphoneStartup.pending) clearMicrophoneFailure();
   try {
     if (state.finalizingRecording) throw new Error("The previous recording is still being finalized.");
     if (!("MediaRecorder" in window)) throw new Error("Audio recording is not supported by this browser.");
@@ -928,6 +949,7 @@ async function startRecording() {
     if (!isMicrophoneStartupConflict(error) && !isMicrophoneStartupCancellation(error)) {
       state.recordingPcm = null;
       await stopMicrophone({ reason: "Microphone unavailable", stateName: "unavailable", preserveSummary: true, silent: true });
+      presentMicrophoneFailure(error, "recording");
     }
   }
 }
@@ -1143,6 +1165,7 @@ function exportDiagnostic(result) {
     observations: isLive ? state.observations : result?.temporalBeta,
     session: isLive ? state.sessionAccumulator?.summary(state.observations) || state.lastSummary : result?.sessionSummary,
     interruptionEvents: isLive ? state.interruptionEvents : result?.captureEvents || [],
+    startupFailure: result ? null : state.microphoneFailure,
   });
   download(`noisecolor-diagnostic-${bundle.acquisition.path}-${Date.now()}.json`, JSON.stringify(bundle, null, 2), "application/json");
 }
@@ -1425,11 +1448,50 @@ function selectCalibration() {
   else elements.calibrationState.textContent = `${state.activeCalibration.name}: separate corrected estimate; raw β is unchanged`;
 }
 
-function showInstallSheet(platform = platformInstallHint()) {
+function updateMicrophoneFailureView() {
+  const failure = state.microphoneFailure;
+  elements.microphoneFailure.hidden = !failure || !["live", "record"].includes(state.currentView);
+  // The recovery card replaces the giant classification placeholder, not navigation.
+  elements.classification.closest(".classification-card").hidden = isIosStandaloneDenial(failure);
+}
+
+function clearMicrophoneFailure() {
+  state.microphoneFailure = null;
+  elements.safariFallback.hidden = true;
+  elements.safariLinkStatus.textContent = "";
+  updateMicrophoneFailureView();
+}
+
+function presentMicrophoneFailure(error, mode) {
+  if (isMicrophoneStartupCancellation(error) || isMicrophoneStartupConflict(error)) return;
+  state.microphoneFailure ||= microphoneStartupFailure(error, { ...microphoneEnvironment(window, navigator), acquisitionMode: mode, stage: "startup" });
+  const iosBlocked = isIosStandaloneDenial(state.microphoneFailure);
+  const title = iosBlocked ? "MICROPHONE BLOCKED BY iOS" : "Microphone unavailable";
+  const detail = iosBlocked
+    ? "NoiseColor can use your microphone in Safari, but iOS is preventing microphone access in this installed web-app session."
+    : state.microphoneFailure.errorMessage;
+  clearStaleMeasurement(title, "unavailable", detail);
+  elements.microphoneFailureTitle.textContent = title;
+  elements.microphoneFailureText.textContent = detail;
+  elements.iosMicrophoneActions.hidden = !iosBlocked;
+  if (mode === "recording") elements.recordStatus.textContent = detail;
+  const canonicalUrl = canonicalAppUrl(location.href);
+  elements.safariCanonicalLink.href = canonicalUrl;
+  elements.safariCanonicalLink.textContent = canonicalUrl;
+  updateMicrophoneFailureView();
+  elements.microphoneFailureTitle.focus();
+}
+
+function showInstallSheet(platform = platformInstallHint(), { reinstall = false } = {}) {
   elements.installSheet.hidden = false;
   elements.appShell.inert = true;
   if (platform === "ios") {
-    elements.installInstructions.innerHTML = "<p>The installed PWA is the iPhone/iPad app experience; it is not an App Store download.</p><ol><li>Open this page in Safari.</li><li>Tap Safari’s Share button.</li><li>Choose <strong>Add to Home Screen</strong>.</li><li>Enable or open as a web app where offered, then tap <strong>Add</strong>.</li></ol>";
+    elements.installInstructions.innerHTML = `<p>For reliable microphone access on iPhone, install NoiseColor as a Safari Home Screen shortcut. Apple’s standalone web-app mode may block microphone access on some iOS versions/devices.</p>
+      <h3>Recommended for Live/Record</h3><p><strong>Home Screen Safari shortcut — microphone-compatible.</strong> Use this option on iPhone and iPad.</p>
+      <ol>${reinstall ? "<li>Remove the existing NoiseColor Home Screen web app.</li>" : ""}<li>Open NoiseColor in Safari.</li><li>Confirm Live Analysis works and allow microphone access.</li><li>Safari → Share → <strong>Add to Home Screen</strong>.</li><li>Turn <strong>Open as Web App OFF</strong>.</li><li>Tap <strong>Add</strong>.</li></ol>
+      ${reinstall ? "<p>Export any results you need before removal. The shortcut opens Safari’s storage, which may differ from the standalone app’s History.</p>" : ""}
+      <p>If that switch is not offered on your iOS version, use NoiseColor directly in Safari for microphone capture.</p>
+      <h3>Standalone web app</h3><p>More app-like presentation, but microphone capture may fail on affected iOS/WebKit versions. This is not the recommended installation for Live/Record.</p>`;
   } else if (state.installPromptReady) {
     elements.installInstructions.innerHTML = '<p>Install NoiseColor as a standalone app on this device.</p><button class="sheet-install-native" type="button">Continue to install</button>';
     elements.installInstructions.querySelector("button").addEventListener("click", async () => {
@@ -1452,7 +1514,7 @@ function hideInstallSheet() {
 
 const pwa = setupPwa({
   onInstallReady: (ready) => { state.installPromptReady = ready; },
-  onInstalled: () => { elements.installButton.textContent = "Installed"; elements.installButton.disabled = true; },
+  onInstalled: () => { elements.installButton.textContent = isIosDevice() ? "Install help" : "Installed"; elements.installButton.disabled = !isIosDevice(); },
   onUpdateAvailable: (activate) => { elements.updateBanner.hidden = false; elements.reloadButton.onclick = activate; },
   onError: (error) => console.warn("Service worker registration failed", error),
 });
@@ -1487,13 +1549,33 @@ document.querySelectorAll("[data-spectrum]").forEach((button) => button.addEvent
   drawSpectrum(state.latestResult);
 }));
 
-elements.startLiveButton.addEventListener("click", async () => {
+async function startLiveAnalysis() {
   try { await startMicrophone(); } catch (error) {
     if (isMicrophoneStartupCancellation(error)) return;
     if (!isMicrophoneStartupConflict(error)) await stopMicrophone({ preserveSummary: true, silent: true });
-    clearStaleMeasurement("Microphone unavailable", "unavailable", error.message);
+    presentMicrophoneFailure(error, "live");
+  }
+}
+elements.startLiveButton.addEventListener("click", startLiveAnalysis);
+elements.retryMicrophoneButton.addEventListener("click", () => {
+  const recording = state.microphoneFailure?.acquisitionMode === "recording";
+  setView(recording ? "record" : "live");
+  if (recording) startRecording(); else startLiveAnalysis();
+});
+elements.openSafariButton.addEventListener("click", () => {
+  openSafariFromGesture(window, location.href);
+  elements.safariFallback.hidden = false;
+});
+elements.copySafariLinkButton.addEventListener("click", async () => {
+  try {
+    await navigator.clipboard.writeText(canonicalAppUrl(location.href));
+    elements.safariLinkStatus.textContent = "Link copied. Open Safari and paste it into the address bar.";
+  } catch {
+    elements.safariLinkStatus.textContent = "Copy is unavailable. Touch and hold the link above, choose Copy, then paste it into Safari’s address bar.";
   }
 });
+elements.reinstallMicrophoneButton.addEventListener("click", () => showInstallSheet("ios", { reinstall: true }));
+elements.exportStartupDiagnosticButton.addEventListener("click", () => state.microphoneFailure && exportDiagnostic(null));
 elements.clearButton.addEventListener("click", resetApplication);
 elements.stopLiveButton.addEventListener("click", () => stopMicrophone());
 elements.analysisMode.addEventListener("change", () => {
@@ -1549,7 +1631,7 @@ drawEmpty(elements.betaCanvas, "Start Live Analysis to see β history");
 drawEmpty(elements.spectrumCanvas, "No spectrum available");
 drawEmpty(elements.spectrogramCanvas, "No spectrogram available");
 displayLiveState(createStatusState("listening", "Listening…", "Start Live Analysis to estimate the current spectral color."));
-if (isStandalone()) { elements.installButton.textContent = "Installed"; elements.installButton.disabled = true; }
+if (isStandalone()) { elements.installButton.textContent = isIosDevice() ? "Install help" : "Installed"; elements.installButton.disabled = !isIosDevice(); }
 else if (new URLSearchParams(location.search).has("install")) showInstallSheet(platformInstallHint());
 if (new URLSearchParams(location.search).get("action") === "upload") setView("upload");
 if (new URLSearchParams(location.search).get("action") === "live") setView("live");

@@ -30,6 +30,69 @@ import { PcmMeter, PcmTrace, pcmMetrics } from "../public/noisecolor/pcm-diagnos
 import { compactMeasurement, historyPaginationState, HISTORY_PAGE_SIZE, HISTORY_RETENTION_LIMIT } from "../public/noisecolor/history.js";
 import { MAX_DECODE_WORKING_BYTES, assessCompressedUploadSafety, estimateCompressedDecodePeakBytes, inspectCompressedLayout, preflightCompressedUpload } from "../public/noisecolor/upload-safety.js";
 import { MicrophoneStartupLock, isMicrophoneStartupCancellation } from "../public/noisecolor/microphone-startup.js";
+import { isIosDevice } from "../public/noisecolor/pwa.js";
+import { canonicalAppUrl, isIosStandaloneDenial, microphoneEnvironment, microphoneStartupFailure, openSafariFromGesture, sanitizeStartupFailure } from "../public/noisecolor/microphone-compatibility.js";
+
+test("iOS compatibility: device and standalone detection remain independent of browser brand", () => {
+  for (const userAgent of ["iPhone AppleWebKit Safari", "iPad AppleWebKit", "iPhone CriOS AppleWebKit"]) assert.equal(isIosDevice({ userAgent }), true);
+  assert.equal(isIosDevice({ userAgent: "Macintosh", platform: "MacIntel", maxTouchPoints: 5 }), true);
+  assert.equal(isIosDevice({ userAgent: "Macintosh", platform: "MacIntel", maxTouchPoints: 0 }), false);
+  assert.equal(isIosDevice({ userAgent: "Android Chrome" }), false);
+  const context = (standalone, display) => microphoneEnvironment({ isSecureContext: true, matchMedia: (query) => ({ matches: query === `(display-mode: ${display})` }) },
+    { userAgent: "iPhone AppleWebKit", standalone, mediaDevices: { getUserMedia() {} } });
+  assert.deepEqual(context(true, "browser"), { standalone: true, displayMode: "browser", ios: true, secureContext: true, mediaDevicesAvailable: true, getUserMediaAvailable: true });
+  assert.equal(context(false, "standalone").standalone, true);
+  assert.equal(context(false, "browser").standalone, false);
+});
+
+test("iOS compatibility: only actual standalone acquisition permission denials trigger Safari recovery", () => {
+  const context = { ios: true, standalone: true, acquisitionMode: "live", stage: "get-user-media" };
+  for (const error of [{ name: "NotAllowedError" }, { name: "PermissionDeniedError" }, { name: "SecurityError" },
+    { name: "Error", message: "The request is not allowed by the user agent or the platform in the current context" }]) {
+    const failure = microphoneStartupFailure(error, context);
+    assert.equal(isIosStandaloneDenial(failure), true);
+    assert.deepEqual(sanitizeStartupFailure(failure), failure);
+    assert.equal(isIosStandaloneDenial({ ...failure, ios: false }), false);
+    assert.equal(isIosStandaloneDenial({ ...failure, standalone: false }), false);
+    assert.equal(isIosStandaloneDenial({ ...failure, stage: "audio-setup" }), false);
+  }
+  assert.equal(isIosStandaloneDenial(microphoneStartupFailure({ name: "NotReadableError" }, context)), false);
+  assert.equal(isIosStandaloneDenial(null), false);
+});
+
+test("iOS compatibility: startup diagnostic bundle has no fabricated science or private error/track data", () => {
+  for (const acquisitionMode of ["live", "recording"]) {
+    const failure = microphoneStartupFailure({ name: "NotAllowedError", message: "permission denied deviceId SECRET groupId SECRET https://private.example/path" },
+      { acquisitionMode, stage: "get-user-media", ios: true, standalone: true, displayMode: "standalone", secureContext: true, mediaDevicesAvailable: true, getUserMediaAvailable: true,
+        trackObtained: false, audioTrackSettings: { deviceId: "SECRET", groupId: "SECRET", sampleRate: 48000 } });
+    const bundle = createDiagnosticBundle(null, { startupFailure: failure });
+    assert.equal(bundle.kind, "microphone-startup-failure");
+    assert.equal(bundle.acquisition.path, acquisitionMode);
+    assert.equal(bundle.appVersion, APP_VERSION);
+    assert.equal(bundle.engineVersion, ENGINE_VERSION);
+    assert.equal(bundle.psd, null);
+    assert.equal(bundle.rawMeasurement, null);
+    assert.equal(bundle.acquisition.audioTrackSettings, null);
+    assert.equal(bundle.privacy.rawAudioIncluded, false);
+    assert.doesNotMatch(JSON.stringify(bundle), /SECRET|deviceId|groupId|private\.example/);
+    assert.throws(() => replayDiagnosticSpectrum(bundle), /incomplete/);
+    const withTrack = sanitizeStartupFailure({ ...failure, trackObtained: true, audioTrackSettings: { sampleRate: 48000, deviceId: "SECRET", groupId: "SECRET", label: "SECRET" } });
+    assert.deepEqual(withTrack.audioTrackSettings, { sampleRate: 48000 });
+  }
+});
+
+test("iOS compatibility: Safari handoff is one same-site gesture with no redirect parameters or automatic retry", () => {
+  const input = "https://example.org/project/noisecolor/index.html?action=live&install=ios#fragment";
+  const expected = "https://example.org/project/noisecolor/";
+  assert.equal(canonicalAppUrl(input), expected);
+  assert.throws(() => canonicalAppUrl("file:///private/noisecolor/index.html"));
+  for (const blocked of [true, false]) {
+    const calls = [];
+    const mockWindow = { open(...args) { calls.push(args); if (blocked) throw new Error("blocked"); return null; } };
+    assert.equal(openSafariFromGesture(mockWindow, input), expected);
+    assert.deepEqual(calls, [[expected, "_blank", "noopener,noreferrer"]]);
+  }
+});
 
 function randomGenerator(seed = 123456789) {
   let value = seed >>> 0;

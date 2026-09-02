@@ -5,7 +5,7 @@ import { mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fftInPlace, fitPowerLaw, welchPSD } from "../tests/fixtures/noisecolor-v067-beta-reference.mjs";
-import { APP_VERSION } from "../public/noisecolor/analysis-engine.js";
+import { APP_VERSION, ENGINE_VERSION } from "../public/noisecolor/analysis-engine.js";
 import { replayDiagnosticSpectrum } from "../public/noisecolor/diagnostic-bundle.js";
 
 const { chromium } = await import(process.env.PLAYWRIGHT_MODULE || "playwright");
@@ -91,7 +91,7 @@ try {
     const bundle = JSON.parse(text);
     assert.equal(bundle.acquisition.path, path);
     assert.equal(bundle.appVersion, APP_VERSION);
-    assert.equal(bundle.engineVersion, APP_VERSION);
+    assert.equal(bundle.engineVersion, ENGINE_VERSION);
     assert.equal(bundle.privacy.rawAudioIncluded, false);
     assert.doesNotMatch(text, /deviceId|groupId|rawSamples|audioBuffer|synthetic-pink-float32\.wav/);
     const replay = replayDiagnosticSpectrum(bundle);
@@ -103,6 +103,10 @@ try {
     return bundle;
   };
   await page.goto(url);
+  // Initial SW activation can reload a first visit. Test capture after control
+  // settles; this does not change or suppress the application's PWA behavior.
+  await page.waitForFunction(() => Boolean(navigator.serviceWorker.controller));
+  await page.waitForLoadState("networkidle");
   await page.locator("#versionLabel").filter({ hasText: APP_VERSION }).waitFor({ state: "attached" });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   await page.locator("#startLiveButton").click();
@@ -128,9 +132,15 @@ try {
   assert.ok(liveBundle.temporal.observations.length >= 8);
   assert.equal(liveBundle.acquisition.window.job, "primary");
   assert.ok(liveBundle.temporal.sessionAggregates.sessionDurationSeconds > liveBundle.acquisition.durationSeconds);
-  assert.equal(liveBundle.rawMeasurement.rawMeasuredBeta, live.rawMeasuredBeta);
+  // A stable window can finish between the pre-stop snapshot and the click.
+  // Match the exported sample window to its actual worker result, not an older
+  // snapshot taken while capture was still advancing.
+  const exportedLiveResult = await page.evaluate((window) => window && globalThis.__qaResults.findLast(({ type, result }) => type === "analyze-live"
+    && result.measurementWindow.startSample === window.startSample && result.measurementWindow.endSample === window.endSample)?.result, liveBundle.acquisition.window);
+  assert.ok(exportedLiveResult, "exported live window was analyzed by the real worker");
+  assert.equal(liveBundle.rawMeasurement.rawMeasuredBeta, exportedLiveResult.rawMeasuredBeta);
   await page.screenshot({ path: join(evidence, "mobile-live-summary.png"), fullPage: true });
-  report.live = { stableResults: liveResults.length, beta: live.rawMeasuredBeta, dbfs: live.dbfs, summary };
+  report.live = { stableResults: liveResults.length, beta: exportedLiveResult.rawMeasuredBeta, dbfs: exportedLiveResult.dbfs, summary };
   console.log(JSON.stringify({ live: report.live }));
 
   await page.locator('[data-view="record"]:visible').click();
