@@ -1,6 +1,6 @@
-import { buildSpectrogram } from "./analysis-engine.js?v=0.6.8-recovery.1";
-import { analyzePcm } from "./analysis-pipeline.js?v=0.6.8-recovery.1";
-import { normalizePcm } from "./pcm-input.js?v=0.6.8-recovery.1";
+import { buildSpectrogram } from "./analysis-engine.js?v=0.6.8-recovery.2";
+import { analyzePcm } from "./analysis-pipeline.js?v=0.6.8-recovery.2";
+import { normalizePcm } from "./pcm-input.js?v=0.6.8-recovery.2";
 
 self.addEventListener("message", (event) => {
   const { id, type, samples: rawSamples, sampleRate, options } = event.data;

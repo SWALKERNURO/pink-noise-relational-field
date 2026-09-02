@@ -1,6 +1,6 @@
-import { analyzeSamples, analyzeRecording, FFT_SIZE, WELCH_OVERLAP, DEFAULT_FIT_RANGE } from "./analysis-engine.js?v=0.6.8-recovery.1";
-import { normalizePcm } from "./pcm-input.js?v=0.6.8-recovery.1";
-import { pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.1";
+import { analyzeSamples, analyzeRecording, FFT_SIZE, WELCH_OVERLAP, DEFAULT_FIT_RANGE } from "./analysis-engine.js?v=0.6.8-recovery.2";
+import { normalizePcm } from "./pcm-input.js?v=0.6.8-recovery.2";
+import { pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.2";
 
 export const PRIMARY_ANALYSIS_CONFIG = Object.freeze({ fftSize: FFT_SIZE, overlap: WELCH_OVERLAP, fitRange: Object.freeze([...DEFAULT_FIT_RANGE]), maxWelchSegments: 48 });
 const PATHS = { live: "live", recording: "recorded-microphone", upload: "uploaded-file" };
@@ -19,6 +19,8 @@ export function analyzePcm({ samples: input, sampleRate, path, options = {} }) {
   result.acquisition = { ...options.acquisition, path, representation: "mono-float32", fullScale: 1, normalization: "representation-only; no gain or resampling" };
   result.measurementWindow = { startSample, endSample: startSample + samples.length, sampleCount: samples.length, timeBasis: "captured-PCM-samples", job: options.job || "primary", requestId: options.requestId ?? null };
   result.captureEvents = structuredClone(options.captureEvents || []);
+  if (path === "live") result.qualityContext = { ...result.qualityContext,
+    observationTimeBasis: "captured-PCM-session-origin", temporalWindowSeconds: result.durationSeconds, activityFrameSeconds: 0.5 };
   result.pcmDiagnostics = { ...options.pcmDiagnostics, ...result.pcmDiagnostics, workerInput: pcmMetrics(samples), analyzerInput: result.pcm };
   return result;
 }

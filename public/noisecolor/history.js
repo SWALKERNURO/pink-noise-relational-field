@@ -1,4 +1,4 @@
-import { sanitizeAudioSettings, sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.1";
+import { sanitizeAudioSettings, sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.2";
 
 const DATABASE_NAME = "noisecolor-local-history";
 const DATABASE_VERSION = 2;

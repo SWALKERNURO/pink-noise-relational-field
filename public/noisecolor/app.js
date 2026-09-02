@@ -7,18 +7,18 @@ import {
   WELCH_OVERLAP,
   SessionAccumulator,
   summarize,
-} from "./analysis-engine.js?v=0.6.8-recovery.1";
-import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.8-recovery.1";
-import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.8-recovery.1";
-import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.8-recovery.1";
-import { capturePcm, liveWindowProvenance, LiveAnalysisScheduler, MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow, sessionSignalPercentages } from "./live-runtime.js?v=0.6.8-recovery.1";
-import { PcmTrace, PcmMeter } from "./pcm-diagnostics.js?v=0.6.8-recovery.1";
-import { mixToMono, decodePcmWavTail } from "./pcm-input.js?v=0.6.8-recovery.1";
-import { PRIMARY_ANALYSIS_CONFIG } from "./analysis-pipeline.js?v=0.6.8-recovery.1";
-import { browserDiagnosticInfo, canExportDiagnostic, createDiagnosticBundle } from "./diagnostic-bundle.js?v=0.6.8-recovery.1";
-import { sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.1";
-import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.8-recovery.1";
-import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.8-recovery.1";
+} from "./analysis-engine.js?v=0.6.8-recovery.2";
+import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.8-recovery.2";
+import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.8-recovery.2";
+import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.8-recovery.2";
+import { capturePcm, CaptureContinuity, liveWindowProvenance, LiveAnalysisScheduler, MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow, sessionSignalPercentages } from "./live-runtime.js?v=0.6.8-recovery.2";
+import { PcmTrace, PcmMeter } from "./pcm-diagnostics.js?v=0.6.8-recovery.2";
+import { mixToMono, decodePcmWavTail } from "./pcm-input.js?v=0.6.8-recovery.2";
+import { PRIMARY_ANALYSIS_CONFIG } from "./analysis-pipeline.js?v=0.6.8-recovery.2";
+import { browserDiagnosticInfo, canExportDiagnostic, createDiagnosticBundle } from "./diagnostic-bundle.js?v=0.6.8-recovery.2";
+import { sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.2";
+import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.8-recovery.2";
+import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.8-recovery.2";
 
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 32 * 1024 * 1024;
@@ -36,6 +36,7 @@ const elements = Object.fromEntries([
   "scalarGain", "railMeasured", "railInterpretation", "railStatus", "versionLabel", "installSheet", "closeInstallSheet",
   "installInstructions", "privacyChip", "summaryTimeline", "betaDataSummary", "spectrumDataSummary", "spectrogramDataSummary",
   "exportLiveDiagnosticButton", "exportDiagnosticButton", "diagnosticExportStatus",
+  "captureInterruption", "captureInterruptionText", "resumeCaptureButton",
 ].map((id) => [id, document.getElementById(id)]));
 
 const stateMachine = new ColorStateMachine();
@@ -77,6 +78,8 @@ const state = {
   latestResult: null,
   liveDiagnosticResult: null,
   interruptionEvents: [],
+  continuity: new CaptureContinuity(),
+  resumingCapture: false,
   latestSpectrogram: null,
   lastSummary: null,
   recorder: null,
@@ -116,6 +119,7 @@ function formatDuration(seconds) {
 }
 
 function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) {
+  const recent = recentStableObservations().filter((item) => item.reliable);
   const profile = state.activeCalibration && state.inputRoute && state.activeCalibration.routeId === state.inputRoute
     ? state.activeCalibration
     : null;
@@ -125,9 +129,9 @@ function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) 
     sourceType,
     sourceFilename,
     calibrationProfile: profile,
-    temporalSd: sourceType === "live" ? summarize(state.observations.slice(-10).filter((item) => item.reliable).map((item) => item.beta)).sd || 0 : 0,
-    temporalObservationCount: sourceType === "live" ? state.observations.slice(-10).filter((item) => item.reliable).length : 0,
-    temporalSelection: sourceType === "live" ? "reliable observations among preceding 10 stable windows" : "computed from recording temporal windows",
+    temporalSd: sourceType === "live" ? summarize(recent.map((item) => item.beta)).sd || 0 : 0,
+    temporalObservationCount: sourceType === "live" ? recent.length : 0,
+    temporalSelection: sourceType === "live" ? "reliable observations among preceding 10 stable windows in current contiguous segment" : "computed from recording temporal windows",
     previousProminentPeakFrequencies: sourceType === "live" ? state.latestResult?.prominentPeakFrequencies || [] : [],
     scalarGainDb: Number(elements.scalarGain.value) || 0,
     calibrationRouteKey: state.inputRoute,
@@ -144,9 +148,14 @@ function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) 
   };
 }
 
+function recentStableObservations() {
+  const segmentStartSeconds = state.sampleRate ? state.continuity.segmentStartSample / state.sampleRate : 0;
+  return state.observations.slice(-10).filter((item) => item.startSeconds >= segmentStartSeconds);
+}
+
 function ensureWorker() {
   if (state.worker) return state.worker;
-  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.8-recovery.1", import.meta.url), { type: "module" });
+  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.8-recovery.2", import.meta.url), { type: "module" });
   state.worker.addEventListener("message", (event) => {
     const request = state.workerRequests.get(event.data.id);
     if (!request) return;
@@ -239,6 +248,8 @@ function displayLiveState(display, measurement = null) {
 }
 
 function clearStaleMeasurement(label = "Analysis paused", stateName = "paused", detail = "Live values were cleared because the microphone is not active.") {
+  elements.exportDiagnosticButton.disabled = true;
+  elements.diagnosticExportStatus.textContent = "No active measurement. The last live diagnostic remains available in Live until Clear or a new capture.";
   state.latestResult = null;
   state.latestSpectrogram = null;
   elements.instantBeta.textContent = "—";
@@ -443,7 +454,7 @@ async function startMicrophone({ recording = false } = {}) {
       const rolling = new RollingBuffer(Math.round(audioContext.sampleRate * ROLLING_SECONDS));
       const sessionAccumulator = new SessionAccumulator(audioContext.sampleRate);
       const captureSamples = (samples) => {
-        if (!state.listening) return;
+        if (!state.listening || state.continuity.paused || state.audioContext !== audioContext) return;
         capturePcm(samples, { rolling, sessionAccumulator, recordingBuffer: state.recordingPcm, trace: state.pcmTrace, fallback: state.latestResult });
       };
       state.pcmTrace = new PcmTrace();
@@ -458,11 +469,13 @@ async function startMicrophone({ recording = false } = {}) {
 
       let captureNode;
       if (audioContext.audioWorklet) {
-        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.8-recovery.1");
+        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.8-recovery.2");
         startup.checkpoint();
         captureNode = new AudioWorkletNode(audioContext, "noisecolor-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 1, channelCountMode: "explicit", channelInterpretation: "speakers" });
         state.captureTransport = "AudioWorklet / explicit mono input";
         captureNode.port.onmessage = (event) => {
+          if (state.audioContext !== audioContext || !state.listening) return;
+          if (event.data.type === "packet-reset") return;
           state.captureInputPcm = event.data.input;
           if (state.listening) state.pcmTrace.record("workletOutput", event.data.samples);
           captureSamples(event.data.samples);
@@ -472,6 +485,7 @@ async function startMicrophone({ recording = false } = {}) {
         state.captureTransport = "ScriptProcessor / mono input";
         const inputMeter = new PcmMeter();
         captureNode.onaudioprocess = (event) => {
+          if (state.audioContext !== audioContext || !state.listening) return;
           const samples = new Float32Array(event.inputBuffer.getChannelData(0));
           state.captureInputPcm = inputMeter.add(samples);
           if (state.listening) state.pcmTrace.record("scriptProcessorOutput", samples);
@@ -512,6 +526,9 @@ async function startMicrophone({ recording = false } = {}) {
         state.liveDiagnosticResult = null;
         state.lastSummary = null;
         state.interruptionEvents = [];
+        state.continuity = new CaptureContinuity();
+        state.interruptionEvents = state.continuity.events;
+        elements.captureInterruption.hidden = true;
         elements.exportLiveDiagnosticButton.disabled = true;
         state.latestSpectrogram = null;
         state.captureGeneration += 1;
@@ -520,10 +537,10 @@ async function startMicrophone({ recording = false } = {}) {
         drawEmpty(elements.betaCanvas, "Listening for a stable estimate…");
         drawEmpty(elements.spectrumCanvas, "Waiting for a stable spectrum…");
         drawEmpty(elements.spectrogramCanvas, "Waiting for spectrogram data…");
-        track.addEventListener("ended", () => interruptActiveCapture("Microphone unavailable", "unavailable"));
-        track.addEventListener("mute", () => interruptActiveCapture("Microphone interrupted", "unavailable"));
+        track.addEventListener("ended", () => { if (state.stream === stream) interruptActiveCapture("Microphone unavailable", "unavailable", { terminal: true }); });
+        track.addEventListener("mute", () => { if (state.stream === stream) interruptActiveCapture("Microphone interrupted", "unavailable"); });
         audioContext.addEventListener("statechange", () => {
-          if (state.listening && audioContext.state !== "running" && !state.stopping) interruptActiveCapture(`Audio processing ${audioContext.state}`, "paused");
+          if (state.listening && state.audioContext === audioContext && audioContext.state !== "running" && !state.stopping) interruptActiveCapture(`Audio processing ${audioContext.state}`, "paused", { terminal: audioContext.state === "closed" });
         });
         if (!recording) startSchedulers();
         setMicrophoneStartupControls(recording, false, true);
@@ -586,7 +603,7 @@ function stopSchedulers() {
 }
 
 async function runFastAnalysis() {
-  if (!state.listening || state.fastBusy || state.workerBusy || !state.rolling) return;
+  if (!state.listening || state.continuity.paused || state.fastBusy || state.workerBusy || !state.rolling) return;
   const config = modeConfig();
   if (state.rolling.length < state.sampleRate * Math.min(1.5, config.fastSeconds)) return;
   state.fastBusy = true;
@@ -606,7 +623,7 @@ async function runFastAnalysis() {
 }
 
 async function runStableAnalysis() {
-  if (!state.listening || state.stableBusy || state.workerBusy || !state.rolling) return;
+  if (!state.listening || state.continuity.paused || state.stableBusy || state.workerBusy || !state.rolling) return;
   const config = modeConfig();
   if (state.rolling.length < state.sampleRate * config.stableSeconds) return;
   state.stableBusy = true;
@@ -617,7 +634,7 @@ async function runStableAnalysis() {
     if (!state.listening || generation !== state.captureGeneration) return;
     const timeSeconds = result.measurementWindow.endSample / result.sampleRate;
     const stableSeconds = result.measurementWindow.sampleCount / result.sampleRate;
-    const observation = { timeSeconds: Math.max(0, timeSeconds - stableSeconds / 2), startSeconds: Math.max(0, timeSeconds - stableSeconds), endSeconds: timeSeconds, beta: result.beta, state: result.state, classification: result.classification, reliable: result.reliable, rmseDb: result.rmseDb, r2: result.r2, spectralFlatness: result.spectralFlatness };
+    const observation = { timeSeconds: Math.max(0, timeSeconds - stableSeconds / 2), startSeconds: result.measurementWindow.startSample / result.sampleRate, endSeconds: timeSeconds, beta: result.beta, state: result.state, classification: result.classification, reliable: result.reliable, rmseDb: result.rmseDb, r2: result.r2, spectralFlatness: result.spectralFlatness };
     state.observations.push(observation);
     if (state.observations.length > 3600) state.observations.splice(0, state.observations.length - 3600);
     state.betaHistory.push(observation);
@@ -629,7 +646,7 @@ async function runStableAnalysis() {
     displayLiveState(display, result);
     // Session science uses the measured decision, never the hysteretic UI label.
     state.sessionAccumulator?.addObservation(observation);
-    const stableValues = state.observations.slice(-10).filter((item) => item.reliable).map((item) => item.beta);
+    const stableValues = recentStableObservations().filter((item) => item.reliable).map((item) => item.beta);
     const stableSummary = summarize(stableValues);
     elements.stability.textContent = Number.isFinite(stableSummary.sd) ? `±${stableSummary.sd.toFixed(2)}` : "—";
     elements.fitResidual.textContent = formatNumber(result.rmseDb, 2, " dB");
@@ -666,6 +683,7 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
   const cancelledStartup = await cancelMicrophoneStartup();
   if (state.stopping || (!state.stream && !state.audioContext)) return;
   state.stopping = true;
+  elements.captureInterruption.hidden = true;
   state.listening = false;
   state.captureGeneration += 1;
   stopSchedulers();
@@ -742,12 +760,87 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
   }
 }
 
-async function interruptActiveCapture(reason, stateName = "paused") {
+async function interruptActiveCapture(reason, stateName = "paused", { terminal = false } = {}) {
   if (state.finalizingRecording || state.stopping) return;
-  state.interruptionEvents.push({ kind: reason, sampleOffset: state.sessionAccumulator?.inputMeter.sampleCount ?? 0,
-    elapsedSeconds: state.startedAt ? (performance.now() - state.startedAt) / 1000 : 0, recovered: false });
-  if (state.recording) await stopRecording({ interrupted: true, reason });
-  else await stopMicrophone({ reason, stateName });
+  const track = state.stream?.getAudioTracks()[0];
+  if (!state.listening && !microphoneStartup.pending) return;
+  if (terminal || !track || track.readyState !== "live") {
+    state.interruptionEvents.push({ kind: reason, sampleOffset: state.sessionAccumulator?.inputMeter.sampleCount ?? 0,
+      elapsedSeconds: state.startedAt ? (performance.now() - state.startedAt) / 1000 : 0, recovered: false });
+    if (state.recording) await stopRecording({ interrupted: true, reason });
+    else await stopMicrophone({ reason, stateName });
+    return;
+  }
+  if (!state.continuity.pause(reason, state.sessionAccumulator.inputMeter.sampleCount, (performance.now() - state.startedAt) / 1000)) return;
+  state.captureGeneration += 1;
+  stopSchedulers();
+  state.sessionAccumulator.finish(state.latestResult);
+  state.rolling.clear();
+  clearStaleMeasurement("Capture paused", "paused", "The microphone remains available. Resume to begin a new contiguous analysis window.");
+  elements.captureInterruption.hidden = false;
+  elements.captureInterruptionText.textContent = `${reason}. No PCM is being retained during this pause. Resume capture or stop to analyze the last contiguous segment.`;
+  elements.resumeCaptureButton.disabled = true;
+  if (state.recording) elements.recordStatus.textContent = "Recording paused; available audio is preserved. Resume or Stop & Analyze.";
+  try {
+    if (state.recorder?.state === "recording") state.recorder.pause();
+    await releaseWakeLock();
+    if (state.audioContext?.state === "running") await state.audioContext.suspend();
+  } catch (error) {
+    elements.captureInterruptionText.textContent = `Capture paused: ${error.message}. Stop if this browser cannot resume.`;
+  } finally {
+    elements.resumeCaptureButton.disabled = false;
+  }
+}
+
+function resetWorkletPacket(node) {
+  if (!node?.port) return Promise.resolve();
+  return new Promise((resolve, reject) => {
+    const token = ++state.workerId;
+    const finish = (error) => {
+      window.clearTimeout(timeout);
+      node.port.removeEventListener("message", onMessage);
+      error ? reject(error) : resolve();
+    };
+    const onMessage = ({ data }) => { if (data?.type === "packet-reset" && data.token === token) finish(); };
+    const timeout = window.setTimeout(() => finish(new Error("Audio packet reset timed out.")), 2000);
+    node.port.addEventListener("message", onMessage);
+    node.port.postMessage({ type: "reset-packet", token });
+  });
+}
+
+async function resumeCapture() {
+  if (!state.continuity.paused || state.resumingCapture || !state.listening) return;
+  const context = state.audioContext;
+  const continuity = state.continuity;
+  const generation = state.captureGeneration;
+  state.resumingCapture = true;
+  elements.resumeCaptureButton.disabled = true;
+  try {
+    const track = state.stream?.getAudioTracks()[0];
+    if (document.hidden || track?.readyState !== "live" || track.muted) throw new Error("Keep the app visible and wait for the microphone to become available.");
+    await resumeAudioContext(context);
+    await resetWorkletPacket(state.captureNode);
+    if (!state.listening || state.audioContext !== context || state.continuity !== continuity || generation !== state.captureGeneration) return;
+    if (state.recording && state.recorder?.state !== "paused") throw new Error("The browser recorder cannot resume. Stop & Analyze the retained segment.");
+    if (track.muted || context.state !== "running" || document.hidden) throw new Error("The microphone is still interrupted.");
+    if (state.recording) state.recorder.resume();
+    state.constraintSettings = track.getSettings?.() || {};
+    state.inputRoute = inputRouteFromTrack(track);
+    selectCalibration();
+    state.rolling.clear();
+    continuity.resume(state.sessionAccumulator.inputMeter.sampleCount, (performance.now() - state.startedAt) / 1000);
+    stateMachine.reset();
+    elements.captureInterruption.hidden = true;
+    displayLiveState(stateMachine.reset());
+    if (!state.recording) startSchedulers();
+    else elements.recordStatus.textContent = "Recording resumed. Analysis will use the final contiguous segment; the separate audio download retains earlier recorded segments.";
+    await acquireWakeLock();
+  } catch (error) {
+    elements.captureInterruptionText.textContent = `Still paused: ${error.message}`;
+  } finally {
+    state.resumingCapture = false;
+    elements.resumeCaptureButton.disabled = false;
+  }
 }
 
 function renderSessionSummary(summary) {
@@ -812,7 +905,7 @@ async function startRecording() {
     };
     recorder.addEventListener("error", (event) => {
       elements.recordStatus.textContent = event.error?.message || "Recording failed.";
-      interruptActiveCapture("Recording interrupted", "unavailable");
+      interruptActiveCapture("Recording interrupted", "unavailable", { terminal: true });
     });
     recorder.addEventListener("stop", () => {
       if (state.recording && !state.finalizingRecording) stopRecording({ interrupted: true, reason: "Recording stopped by the browser" });
@@ -849,7 +942,8 @@ async function stopRecording({ interrupted = false, reason = "" } = {}) {
   elements.recordStatus.textContent = interrupted ? "The recording was interrupted. Finalizing available audio locally…" : "Finalizing and analyzing the recording locally…";
   window.clearInterval(state.recordTimer);
   const recorder = state.recorder;
-  const samples = state.recordingPcm?.latest() || new Float32Array();
+  const retainedLength = state.continuity.finalSegmentLength(state.sessionAccumulator?.inputMeter.sampleCount || 0, state.recordingPcm?.length || 0);
+  const samples = state.recordingPcm?.latest(retainedLength) || new Float32Array();
   state.recordingPcm = null;
   const sampleRate = state.sampleRate;
   const recordingOptions = currentOptions("recorded-microphone");
@@ -888,7 +982,7 @@ async function stopRecording({ interrupted = false, reason = "" } = {}) {
     renderResult(elements.recordResult, result);
     renderAdvanced(result);
     const windowNote = result.analysisTruncated ? ` The final ${formatDuration(result.durationSeconds)} of ${formatDuration(result.sourceDurationSeconds)} was analyzed.` : "";
-    elements.recordStatus.textContent = `${interrupted ? `${reason || "Recording interrupted"}. ` : ""}Original captured PCM analyzed locally.${windowNote} The download is separately encoded by the browser and may differ slightly.`;
+    elements.recordStatus.textContent = `${interrupted ? `${reason || "Recording interrupted"}. ` : ""}Original captured PCM analyzed locally.${windowNote}${result.captureEvents?.length ? " Only the final contiguous captured segment is analyzed; interruption boundaries are in the diagnostic bundle." : ""} The download is separately encoded by the browser and may differ slightly.`;
   } catch (error) {
     if (state.recordingAnalysisGeneration !== state.analysisGeneration) return;
     elements.recordStatus.textContent = `Recording could not be analyzed: ${error.message}`;
@@ -1428,6 +1522,7 @@ elements.exportSummaryButton.addEventListener("click", () => state.lastSummary &
 elements.exportSummaryCsvButton.addEventListener("click", () => state.lastSummary && exportCsv(state.lastSummary));
 elements.exportLiveDiagnosticButton.addEventListener("click", () => state.liveDiagnosticResult && exportDiagnostic(state.liveDiagnosticResult));
 elements.exportDiagnosticButton.addEventListener("click", () => canExportDiagnostic(state.latestResult) && exportDiagnostic(state.latestResult));
+elements.resumeCaptureButton.addEventListener("click", resumeCapture);
 elements.calibrationFile.addEventListener("change", (event) => importCalibration(event.target.files?.[0]));
 elements.calibrationProfile.addEventListener("change", selectCalibration);
 elements.installButton.addEventListener("click", async () => {
@@ -1445,7 +1540,7 @@ document.addEventListener("visibilitychange", () => {
 navigator.mediaDevices?.addEventListener?.("devicechange", () => {
   if (state.listening || microphoneStartup.pending) interruptActiveCapture("Microphone device changed", "paused");
 });
-window.addEventListener("pagehide", () => interruptActiveCapture("Page closed", "paused"));
+window.addEventListener("pagehide", (event) => interruptActiveCapture("Page closed", "paused", { terminal: !event.persisted }));
 window.addEventListener("beforeunload", releaseRecordingObject);
 
 elements.versionLabel.textContent = `NoiseColor v${APP_VERSION} · engine v${ENGINE_VERSION}`;

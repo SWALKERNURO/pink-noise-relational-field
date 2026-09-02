@@ -43,6 +43,12 @@ No raw PCM, encoded audio, deviceId, groupId, route identifiers, filenames, trac
 
 ## Evidence
 
+### Recoverable interruptions
+
+When a microphone track remains live, mute, audio suspension, backgrounding and device-change events pause capture instead of discarding the recording/session. **Resume capture** is explicit; it requires a visible page, live/unmuted track and running AudioContext. Ended tracks, closed contexts and final page closure still finalize safely.
+
+No paused interval is filled with zeros or counted as Low signal. Pause finishes the pending activity frame. Resume clears the live ring and worklet partial packet (with acknowledgement), resets contiguous-window temporal evidence and records a new sample boundary. Recording analysis uses only the final contiguous captured segment; its source-duration/start-offset fields disclose excluded earlier segments. The separately encoded opt-in audio download can retain earlier segments. Bundles record pause/resume sample boundaries and elapsed gap duration; captured-PCM time excludes gaps. Physical browser/OS interruption behavior still requires device acceptance.
+
 The baseline 57 tests passed before changes. Recovery adds exact adapter/worker cross-path comparisons for canonical beta −2/−1/0/+1/+2, acoustic-like noise, tones, broken spectra and silence; multichannel/sample-rate checks; explicit window/context differences; privacy/schema/replay checks; and confidence ownership checks.
 
 The existing reported-style acoustic fixture remains beta 1.36143753634769, SD 0.02980651479724472, RMSE 3.897909223702877 dB, Moderate Pink-like. The synthetic low-pass example remains beta 3.740265708418 in both frozen and current estimators. It is a counterexample to estimator mutation, **not** a diagnosis of the user's recording.

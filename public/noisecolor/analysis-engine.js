@@ -1,8 +1,8 @@
-import { PcmMeter, pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.1";
-import { sanitizeAudioSettings } from "./privacy.js?v=0.6.8-recovery.1";
+import { PcmMeter, pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.2";
+import { sanitizeAudioSettings } from "./privacy.js?v=0.6.8-recovery.2";
 
-export const APP_VERSION = "0.6.8-recovery.1";
-export const ENGINE_VERSION = "0.6.8-recovery.1";
+export const APP_VERSION = "0.6.8-recovery.2";
+export const ENGINE_VERSION = "0.6.8-recovery.2";
 export const FFT_SIZE = 4096;
 export const WELCH_OVERLAP = 0.5;
 export const DEFAULT_FIT_RANGE = [100, 8000];

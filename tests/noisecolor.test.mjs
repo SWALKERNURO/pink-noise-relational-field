@@ -22,7 +22,7 @@ import {
 import { ColorStateMachine } from "../public/noisecolor/live-state.js";
 import { analyzePcm } from "../public/noisecolor/analysis-pipeline.js";
 import { normalizePcm, mixToMono, decodePcmWavTail } from "../public/noisecolor/pcm-input.js";
-import { liveWindowProvenance } from "../public/noisecolor/live-runtime.js";
+import { CaptureContinuity, liveWindowProvenance } from "../public/noisecolor/live-runtime.js";
 import { canExportDiagnostic, createDiagnosticBundle, replayDiagnosticSpectrum, browserDiagnosticInfo } from "../public/noisecolor/diagnostic-bundle.js";
 import { sanitizeMetadata, sanitizeAudioSettings } from "../public/noisecolor/privacy.js";
 import { capturePcm, LiveAnalysisScheduler, MODE_CONFIG, RollingBuffer, selectBoundedAnalysisWindow, sessionSignalPercentages } from "../public/noisecolor/live-runtime.js";
@@ -223,6 +223,44 @@ function twoRegimeNoise({ sampleRate = 16000, size = 65536, seed = 73, breakpoin
 
 const analysisOptions = { fitRange: [100, 7000], analysisMode: "test" };
 
+test("recovery: interruptions preserve boundaries and never splice pre/post-pause PCM into a fit", () => {
+  const continuity = new CaptureContinuity();
+  const recorded = new RollingBuffer(160000);
+  const before = coloredNoise(2);
+  const after = coloredNoise(0);
+  recorded.push(before);
+  assert.equal(continuity.pause("context-suspended", before.length, 4.1), true);
+  assert.equal(continuity.pause("track-muted", before.length, 4.2), false);
+  assert.equal(continuity.finalSegmentLength(before.length, recorded.length), before.length);
+  assert.equal(continuity.resume(before.length, 10.1), true);
+  recorded.push(after);
+  const count = before.length + after.length;
+  const selected = recorded.latest(continuity.finalSegmentLength(count, recorded.length));
+  assert.deepEqual(selected, after);
+  assert.equal(continuity.events[0].gapSeconds, 6);
+  assert.equal(continuity.events[0].recovered, true);
+  const actual = analyzePcm({ samples: selected, sampleRate: 16000, path: "recording", options: liveWindowProvenance(selected.length, count, 16000) });
+  const expected = analyzePcm({ samples: after, sampleRate: 16000, path: "upload" });
+  assert.deepEqual(actual.measurement, expected.measurement);
+  assert.equal(actual.measurementWindow.startSample, before.length);
+});
+
+test("recovery: worklet reset acknowledgement discards a partial pre-interruption packet", async () => {
+  let Processor;
+  const messages = [];
+  const source = (await readFile(new URL("../public/noisecolor/audio-worklet.js", import.meta.url), "utf8")).replace(/^import .*;\r?\n/gm, "");
+  vm.runInNewContext(source, { Float32Array, PcmMeter, pcmMetrics,
+    AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (data) => messages.push(data) }; } },
+    registerProcessor: (_, implementation) => { Processor = implementation; } });
+  const processor = new Processor();
+  processor.process([[new Float32Array(128).fill(0.4)]]);
+  processor.port.onmessage({ data: { type: "reset-packet", token: 123 } });
+  assert.equal(messages[0].type, "packet-reset");
+  assert.equal(messages[0].token, 123);
+  processor.process([[new Float32Array(2048).fill(0.1)]]);
+  assert.deepEqual(messages[1].samples, new Float32Array(2048).fill(0.1));
+});
+
 function floatWav(channels, sampleRate) {
   const samples = channels[0].length;
   const buffer = new ArrayBuffer(44 + samples * channels.length * 4);
@@ -364,6 +402,9 @@ test("recovery: diagnostic bundle is exact, closed-schema, identifier-free, audi
   assert.doesNotMatch(JSON.stringify(compactMeasurement(result)), /SECRET|deviceId|groupId|rawSamples/);
   const browser = browserDiagnosticInfo({ userAgent: "Mozilla/5.0 (PRIVATE DEVICE) Chrome/123.4.5 Safari/123" }, { secureContext: true });
   assert.deepEqual(browser, { family: "Chrome", version: "123.4.5", secureContext: true, standalone: false });
+  assert.equal(browserDiagnosticInfo({ userAgent: "Chrome/123.0 Safari/1 Edg/124.0" }).family, "Edge");
+  assert.equal(browserDiagnosticInfo({ userAgent: "Mobile CriOS/125.0 Safari/1" }).family, "Chrome");
+  assert.equal(browserDiagnosticInfo({ userAgent: "Mobile FxiOS/126.0 Safari/1" }).family, "Firefox");
 });
 
 test("recovery: acoustic confidence remains engine-owned and never upgraded by live smoothing", () => {

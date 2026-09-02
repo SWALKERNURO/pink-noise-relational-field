@@ -38,6 +38,14 @@ const report = { version: APP_VERSION, synthetic: true, evidence };
 try {
   const context = await browser.newContext({ viewport: { width: 390, height: 844 }, acceptDownloads: true });
   await context.addInitScript(({ pcm, rate }) => {
+    const NativeContext = window.AudioContext;
+    window.AudioContext = class extends NativeContext {
+      constructor(options) { super(options); if (options?.latencyHint === "interactive") window.__qaAppContext = this; }
+    };
+    const NativeRecorder = window.MediaRecorder;
+    window.MediaRecorder = class extends NativeRecorder {
+      constructor(...args) { super(...args); window.__qaRecorder = this; }
+    };
     window.__qaResults = [];
     const WorkerClass = window.Worker;
     window.Worker = class extends WorkerClass {
@@ -65,6 +73,7 @@ try {
       const destination = sourceContext.createMediaStreamDestination();
       source.connect(destination);
       source.start();
+      window.__qaCaptureStream = destination.stream;
       return destination.stream;
     };
   }, { pcm: Array.from(fixture), rate });
@@ -86,8 +95,8 @@ try {
     assert.equal(bundle.privacy.rawAudioIncluded, false);
     assert.doesNotMatch(text, /deviceId|groupId|rawSamples|audioBuffer|synthetic-pink-float32\.wav/);
     const replay = replayDiagnosticSpectrum(bundle);
-    assert.equal(replay.rawFit.beta, bundle.rawMeasurement.rawMeasuredBeta);
-    assert.equal(replay.rawFit.rmseDb, bundle.rawMeasurement.rmseDb);
+    assert.ok(Math.abs(replay.rawFit.beta - bundle.rawMeasurement.rawMeasuredBeta) < 1e-12, "cross-runtime PSD beta replay within numerical precision");
+    assert.ok(Math.abs(replay.rawFit.rmseDb - bundle.rawMeasurement.rmseDb) < 1e-12, "cross-runtime RMSE replay within numerical precision");
     assert.equal(bundle.acquisition.window.endSample - bundle.acquisition.window.startSample, bundle.rawMeasurement.pcm.sampleCount);
     assert.equal(bundle.pcmStages.workerInput.dbfs, bundle.rawMeasurement.pcm.dbfs);
     assert.equal(bundle.configuration.welch.segmentStarts.length, bundle.configuration.welch.segments);
@@ -97,9 +106,11 @@ try {
   await page.locator("#versionLabel").filter({ hasText: APP_VERSION }).waitFor({ state: "attached" });
   assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
   await page.locator("#startLiveButton").click();
+  await page.waitForFunction(() => document.getElementById("privacyChip").textContent === "Listening locally", null, { timeout: 10000 });
   console.log("Synthetic live capture started (28 seconds).");
   await page.waitForTimeout(28000);
   const liveResults = await page.evaluate(() => window.__qaResults.filter((x) => x.type === "analyze-live"));
+  if (!liveResults.length) console.error(JSON.stringify({ evidence, errors, page: await page.locator("body").innerText(), capture: await page.evaluate(() => ({ contextState: window.__qaAppContext?.state, track: window.__qaCaptureStream?.getAudioTracks()[0]?.readyState, muted: window.__qaCaptureStream?.getAudioTracks()[0]?.muted, messages: window.__qaResults })) }));
   assert.ok(liveResults.length >= 8, `stable results ${liveResults.length}`);
   const live = liveResults.at(-1).result;
   assert.equal(live.state, "pink");
@@ -136,6 +147,27 @@ try {
   assert.equal(recordedBundle.rawMeasurement.rawMeasuredBeta, recorded.rawMeasuredBeta);
   report.recorded = { beta: recorded.rawMeasuredBeta, dbfs: recorded.dbfs, identicalBufferWorkerDbfs: true };
 
+  // Suspend the real AudioContext. The live track can be resumed explicitly.
+  await page.locator("#recordButton").click();
+  await page.waitForTimeout(4000);
+  await page.evaluate(() => window.__qaAppContext.suspend());
+  await page.locator("#captureInterruption:not([hidden])").waitFor();
+  assert.equal(await page.evaluate(() => window.__qaCaptureStream.getAudioTracks()[0].readyState), "live");
+  assert.equal(await page.evaluate(() => window.__qaRecorder.state), "paused");
+  await page.waitForTimeout(1200);
+  await page.locator("#resumeCaptureButton").click();
+  await page.locator("#captureInterruption").waitFor({ state: "hidden" });
+  await page.waitForTimeout(8500);
+  await page.locator("#stopRecordButton").click();
+  await page.locator("#recordResult:not([hidden])").waitFor();
+  const resumed = await diagnosticDownload('#recordResult [data-action="diagnostic"]', "recording", "resumed-recording");
+  assert.ok(resumed.acquisition.window.startSample > 0);
+  assert.ok(resumed.acquisition.durationSeconds < resumed.acquisition.sourceDurationSeconds);
+  assert.ok(resumed.capture.interruptions.some((event) => event.recovered && event.gapSeconds >= 1));
+  assert.equal(resumed.classification.state, "pink");
+  assert.ok(Math.abs(resumed.rawMeasurement.pcm.dbfs + 18) < 0.3);
+  report.recoverableInterruption = { recorded: true, finalContiguousSegment: true, gapExcludedFromPcm: true };
+
   await page.locator('[data-view="upload"]:visible').click();
   await page.locator("#audioFile").setInputFiles({ name: "synthetic-pink-float32.wav", mimeType: "audio/wav", buffer: wav });
   await page.locator("#uploadResult:not([hidden])").waitFor();
@@ -163,7 +195,19 @@ try {
   assert.equal(fallback.state, "pink");
   assert.ok(Math.abs(fallback.dbfs + 18) < 0.3);
   assert.match(fallback.pcmDiagnostics.source.transport, /ScriptProcessor/);
-  await page.locator("#stopLiveButton").click();
+  await page.evaluate(() => window.__qaAppContext.suspend());
+  await page.locator("#captureInterruption:not([hidden])").waitFor();
+  await page.locator("#resumeCaptureButton").click();
+  await page.waitForFunction(() => window.__qaResults.findLast((x) => x.type === "analyze-live")?.result.captureEvents?.some((event) => event.recovered), null, { timeout: 15000 });
+  const recoveredLive = await page.evaluate(() => window.__qaResults.findLast((x) => x.type === "analyze-live").result);
+  assert.equal(recoveredLive.state, "pink");
+  assert.ok(recoveredLive.measurementWindow.startSample >= recoveredLive.captureEvents[0].resumeSampleOffset);
+  await page.evaluate(() => { const track = window.__qaCaptureStream.getAudioTracks()[0]; track.stop(); track.dispatchEvent(new Event("ended")); });
+  await page.locator("#startLiveButton").waitFor({ state: "visible" });
+  const endedBundle = await diagnosticDownload("#exportLiveDiagnosticButton", "live", "ended-live");
+  assert.ok(endedBundle.capture.interruptions.some((event) => event.kind === "Microphone unavailable"));
+  report.recoverableInterruption.liveScriptProcessor = true;
+  report.recoverableInterruption.endedTrackFinalized = true;
   report.scriptProcessor = { beta: fallback.rawMeasuredBeta, dbfs: fallback.dbfs };
   await page.evaluate(() => navigator.serviceWorker.ready);
   await page.reload();

@@ -1,5 +1,5 @@
-import { fitPowerLaw, spectralFlatness, tonalityDiagnostics, modelAdequacyDiagnostics } from "./analysis-engine.js?v=0.6.8-recovery.1";
-import { sanitizeAudioSettings, sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.1";
+import { fitPowerLaw, spectralFlatness, tonalityDiagnostics, modelAdequacyDiagnostics } from "./analysis-engine.js?v=0.6.8-recovery.2";
+import { sanitizeAudioSettings, sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.2";
 
 export const DIAGNOSTIC_SCHEMA = "noisecolor-diagnostic/1";
 const scalar = (value) => value == null || ["number", "boolean", "string"].includes(typeof value);
@@ -14,9 +14,11 @@ const observationKeys = "timeSeconds startSeconds endSeconds beta state classifi
 // No full user-agent string, platform, URL, track label or device identifiers.
 export function browserDiagnosticInfo(navigatorLike, context = {}) {
   const ua = String(navigatorLike?.userAgent || "");
-  const match = ua.match(/(Edg|Firefox|Chrome|Version)\/(\d+(?:\.\d+)*)/);
-  return { family: match ? ({ Edg: "Edge", Version: "Safari" }[match[1]] || match[1]) : "unknown",
-    version: match?.[2] || null, secureContext: Boolean(context.secureContext),
+  const browsers = [["Edge", /Edg(?:A|iOS)?\/(\d+(?:\.\d+)*)/], ["Firefox", /(?:Firefox|FxiOS)\/(\d+(?:\.\d+)*)/],
+    ["Chrome", /(?:Chrome|CriOS)\/(\d+(?:\.\d+)*)/], ["Safari", /Version\/(\d+(?:\.\d+)*)/]];
+  const browser = browsers.find(([, pattern]) => pattern.test(ua));
+  return { family: browser?.[0] || "unknown",
+    version: browser?.[1].exec(ua)?.[1] || null, secureContext: Boolean(context.secureContext),
     standalone: Boolean(context.standalone) };
 }
 
@@ -88,7 +90,7 @@ export function createDiagnosticBundle(result, { observations, session, interrup
       activityTimeline: "completed 500 ms frames", lastActivityFrame: "last completed activity frame",
       workerInput: "exact dispatched PCM", analyzerInput: "same PCM passed to common analyzer",
       amplitude: "float PCM full scale 1; dBFS = 20 log10(RMS), display floor -240 dBFS; null means non-finite/unavailable" },
-    capture: { interruptions: interruptionEvents.map((item) => pick(item, "kind sampleOffset elapsedSeconds recovered")),
+    capture: { interruptions: interruptionEvents.map((item) => pick(item, "kind sampleOffset elapsedSeconds recovered resumeSampleOffset resumeElapsedSeconds gapSeconds")),
       limitation: "A PSD replays spectral measurements, not waveform, physical acoustics or browser processing before capture." },
   };
   return sanitizeMetadata(bundle);

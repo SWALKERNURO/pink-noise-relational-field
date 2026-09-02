@@ -1,4 +1,4 @@
-import { PcmMeter, pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.1";
+import { PcmMeter, pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.2";
 
 class NoiseColorCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
@@ -6,6 +6,12 @@ class NoiseColorCaptureProcessor extends AudioWorkletProcessor {
     this.buffer = new Float32Array(2048);
     this.offset = 0;
     this.inputMeter = new PcmMeter();
+    this.port.onmessage = ({ data }) => {
+      if (data?.type !== "reset-packet") return;
+      this.buffer = new Float32Array(2048);
+      this.offset = 0;
+      this.port.postMessage({ type: "packet-reset", token: data.token });
+    };
   }
 
   process(inputs) {
