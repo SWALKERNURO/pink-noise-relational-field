@@ -1,4 +1,4 @@
-import { CANONICAL_COLORS, nearestCanonical } from "./analysis-engine.js?v=0.6.8";
+import { CANONICAL_COLORS, nearestCanonical } from "./analysis-engine.js?v=0.6.8-recovery.2";
 
 const BLOCKING_STATES = new Set(["silence", "tonal", "mixed", "unstable", "clipping", "insufficient", "invalid", "paused", "unavailable", "listening"]);
 
@@ -78,10 +78,9 @@ export class ColorStateMachine {
     if (reliable && Number.isFinite(this.displayBeta)) {
       if (this.pendingState) confidence = "Provisional";
       else {
-        const distance = Math.abs(this.displayBeta - canonical.beta);
-        if (measurement?.rmseDb <= 2.2 && distance <= 0.3 && (measurement?.temporalSd || 0) <= 0.16) confidence = "High";
-        else if (measurement?.rmseDb <= 3.8 && distance <= 0.55 && (measurement?.temporalSd || 0) <= 0.35) confidence = "Moderate";
-        else confidence = "Low";
+        // Confidence belongs to the scientific gate, not the smoothed display.
+        // An acoustic Moderate result must never be upgraded here.
+        confidence = measurement?.state === this.state ? measurement.confidence || "None" : "Provisional";
       }
     }
     return {

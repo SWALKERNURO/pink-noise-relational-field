@@ -1,5 +1,8 @@
-export const APP_VERSION = "0.6.8";
-export const ENGINE_VERSION = "0.6.8";
+import { PcmMeter, pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.2";
+import { sanitizeAudioSettings } from "./privacy.js?v=0.6.8-recovery.2";
+
+export const APP_VERSION = "0.6.8-recovery.2";
+export const ENGINE_VERSION = "0.6.8-recovery.2";
 export const FFT_SIZE = 4096;
 export const WELCH_OVERLAP = 0.5;
 export const DEFAULT_FIT_RANGE = [100, 8000];
@@ -117,7 +120,7 @@ export function welchPSD(samples, sampleRate, requestedSize = FFT_SIZE, overlap 
     frequencies[bin] = (bin * sampleRate) / size;
     power[bin] = Math.max(accumulated[bin] / Math.max(1, segments), Number.MIN_VALUE);
   }
-  return { frequencies, power, segments, availableSegments, fftSize: size };
+  return { frequencies, power, segments, availableSegments, fftSize: size, hopSamples: step, segmentStarts: starts, windowEnergy: energy };
 }
 
 function correctionAt(frequency, profile) {
@@ -244,43 +247,49 @@ function hingeRegressPoints(xs, ys, breakpointX) {
   };
 }
 
-function solveLinearSystem(matrix, vector) {
-  const size = vector.length;
-  const augmented = matrix.map((row, index) => [...row, vector[index]]);
+function weightedQrFit(rows, ys, weights) {
+  // Reorthogonalized QR, not normal equations (which square conditioning).
+  const size = rows[0].length;
+  const q = [];
+  const r = Array.from({ length: size }, () => new Float64Array(size));
+  let minimumNovelty = 1;
   for (let column = 0; column < size; column += 1) {
-    let pivot = column;
-    for (let row = column + 1; row < size; row += 1) {
-      if (Math.abs(augmented[row][column]) > Math.abs(augmented[pivot][column])) pivot = row;
+    const v = Float64Array.from(rows, (row, i) => row[column] * Math.sqrt(weights[i]));
+    const originalNorm = Math.hypot(...v);
+    for (let pass = 0; pass < 2; pass += 1) {
+      for (let j = 0; j < column; j += 1) {
+        const dot = v.reduce((sum, value, i) => sum + value * q[j][i], 0);
+        r[j][column] += dot;
+        for (let i = 0; i < v.length; i += 1) v[i] -= dot * q[j][i];
+      }
     }
-    if (Math.abs(augmented[pivot][column]) <= 1e-12) return null;
-    [augmented[column], augmented[pivot]] = [augmented[pivot], augmented[column]];
-    const divisor = augmented[column][column];
-    for (let item = column; item <= size; item += 1) augmented[column][item] /= divisor;
-    for (let row = 0; row < size; row += 1) {
-      if (row === column) continue;
-      const factor = augmented[row][column];
-      for (let item = column; item <= size; item += 1) augmented[row][item] -= factor * augmented[column][item];
-    }
+    const norm = Math.hypot(...v);
+    const novelty = norm / Math.max(originalNorm, Number.MIN_VALUE);
+    if (!Number.isFinite(novelty) || novelty < 1e-5) return null;
+    minimumNovelty = Math.min(minimumNovelty, novelty);
+    r[column][column] = norm;
+    q.push(Float64Array.from(v, (value) => value / norm));
   }
-  return augmented.map((row) => row[size]);
+  const coefficients = q.map((column) => column.reduce((sum, value, i) => sum + value * ys[i] * Math.sqrt(weights[i]), 0));
+  for (let i = size - 1; i >= 0; i -= 1) {
+    for (let j = i + 1; j < size; j += 1) coefficients[i] -= r[i][j] * coefficients[j];
+    coefficients[i] /= r[i][i];
+  }
+  return { coefficients, minimumNovelty };
 }
 
 function robustBasisRegression(rows, ys, iterations = 5) {
   if (!rows.length || rows.length < rows[0].length + 2 || rows.length !== ys.length) return null;
-  const coefficientCount = rows[0].length;
   let weights = new Float64Array(rows.length).fill(1);
   let coefficients = null;
+  let minimumNovelty = 1;
+  let fitWeights = weights;
   for (let iteration = 0; iteration < iterations; iteration += 1) {
-    const matrix = Array.from({ length: coefficientCount }, () => new Array(coefficientCount).fill(0));
-    const vector = new Array(coefficientCount).fill(0);
-    for (let row = 0; row < rows.length; row += 1) {
-      for (let left = 0; left < coefficientCount; left += 1) {
-        vector[left] += weights[row] * rows[row][left] * ys[row];
-        for (let right = 0; right < coefficientCount; right += 1) matrix[left][right] += weights[row] * rows[row][left] * rows[row][right];
-      }
-    }
-    coefficients = solveLinearSystem(matrix, vector);
-    if (!coefficients) return null;
+    fitWeights = weights;
+    const solution = weightedQrFit(rows, ys, weights);
+    if (!solution) return null;
+    coefficients = solution.coefficients;
+    minimumNovelty = Math.min(minimumNovelty, solution.minimumNovelty);
     const residuals = ys.map((value, index) => value - rows[index].reduce((sum, basis, item) => sum + basis * coefficients[item], 0));
     const center = median(residuals);
     const scale = 1.4826 * median(residuals.map((value) => Math.abs(value - center)));
@@ -294,6 +303,8 @@ function robustBasisRegression(rows, ys, iterations = 5) {
   const residualCenter = median(residuals);
   return {
     coefficients,
+    minimumNovelty,
+    fitWeights,
     predictions,
     residuals,
     squaredError,
@@ -363,6 +374,7 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
     }
   }
   let strongestAbruptBreakpoint = { slopeDelta: 0, frequency: null, rmseDb: Infinity, improvementDb: 0, relativeImprovement: 0, evidence: 0, supportBins: 0 };
+  const rejectedAdjustedBreakpoints = [];
   if (smoothFit) {
     // Re-test each hinge after accounting for broad, continuous coloration.
     for (let breakpoint = 7; breakpoint <= points.length - 2; breakpoint += 1) {
@@ -372,14 +384,29 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
         return [1, centered, centered ** 2, centered ** 3, centered ** 4, centered ** 5, Math.max(0, x - breakpointX)];
       });
       const adjusted = robustBasisRegression(rows, ys);
-      if (!adjusted) continue;
+      const supportBins = Math.min(breakpoint, points.length - breakpoint);
+      const supportOctaves = Math.min(breakpointX - xs[0], xs.at(-1) - breakpointX) / Math.log10(2);
+      const effectiveCount = (weights) => {
+        const sum = weights.reduce((total, value) => total + value, 0);
+        return sum * sum / Math.max(weights.reduce((total, value) => total + value * value, 0), Number.MIN_VALUE);
+      };
+      const effectiveSupportBins = adjusted ? Math.min(effectiveCount(adjusted.fitWeights.slice(0, breakpoint)), effectiveCount(adjusted.fitWeights.slice(breakpoint))) : 0;
+      const original = hingeRegressPoints(xs, ys, breakpointX);
+      const slopeDelta = adjusted ? Math.abs(adjusted.coefficients.at(-1)) : null;
+      // A polynomial can cancel a huge hinge coefficient with little change in
+      // predictions. Such a coefficient is not an identifiable physical slope.
+      const amplification = slopeDelta / Math.max(0.5, original?.slopeDelta || 0);
+      const reason = !adjusted ? "rank-deficient" : supportBins < 3 || effectiveSupportBins < 2.5 || supportOctaves < 0.25 ? "insufficient-bandwidth"
+        : adjusted.minimumNovelty < 0.01 ? "ill-conditioned" : amplification > 3 ? "polynomial-hinge-cancellation" : null;
+      if (reason) {
+        rejectedAdjustedBreakpoints.push({ frequency: 10 ** breakpointX, slopeDelta, originalSlopeDelta: original?.slopeDelta ?? null, supportBins, effectiveSupportBins, supportOctaves, minimumNovelty: adjusted?.minimumNovelty ?? 0, reason });
+        continue;
+      }
       const improvementDb = smoothFit.rmseDb - adjusted.rmseDb;
       const relativeImprovement = smoothFit.squaredError > 0 ? Math.max(0, 1 - adjusted.squaredError / smoothFit.squaredError) : 0;
-      const slopeDelta = Math.abs(adjusted.coefficients.at(-1));
-      const supportBins = Math.min(breakpoint, points.length - breakpoint);
       const evidence = slopeDelta * relativeImprovement * Math.sqrt(supportBins);
       if (evidence > strongestAbruptBreakpoint.evidence) {
-        strongestAbruptBreakpoint = { slopeDelta, frequency: 10 ** breakpointX, rmseDb: adjusted.rmseDb, improvementDb, relativeImprovement, evidence, supportBins };
+        strongestAbruptBreakpoint = { slopeDelta, frequency: 10 ** breakpointX, rmseDb: adjusted.rmseDb, improvementDb, relativeImprovement, evidence, supportBins, effectiveSupportBins, supportOctaves, minimumNovelty: adjusted.minimumNovelty };
       }
     }
   }
@@ -408,6 +435,10 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
     abruptBreakpointRelativeImprovement: strongestAbruptBreakpoint.relativeImprovement,
     abruptBreakpointEvidence: strongestAbruptBreakpoint.evidence,
     abruptBreakpointSupportBins: strongestAbruptBreakpoint.supportBins,
+    abruptBreakpointSupportOctaves: strongestAbruptBreakpoint.supportOctaves ?? 0,
+    abruptBreakpointEffectiveSupportBins: strongestAbruptBreakpoint.effectiveSupportBins ?? 0,
+    abruptBreakpointMinimumNovelty: strongestAbruptBreakpoint.minimumNovelty ?? null,
+    rejectedAdjustedBreakpoints,
   };
 }
 
@@ -719,8 +750,7 @@ function calibrationSnapshot(profile, applied) {
 }
 
 function sanitizeSettings(settings) {
-  if (!settings || typeof settings !== "object") return null;
-  return Object.fromEntries(Object.entries(settings).filter(([key]) => !["deviceId", "groupId"].includes(key)));
+  return sanitizeAudioSettings(settings);
 }
 
 export function analyzeSamples(samples, sampleRate, options = {}) {
@@ -730,14 +760,25 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
   const requestedProfile = options.calibrationProfile;
   const internalRouteKey = options.calibrationRouteKey || options.inputRouteId;
   const calibrationRouteMatched = Boolean(requestedProfile?.routeId && internalRouteKey && requestedProfile.routeId === internalRouteKey);
-  const psd = applyFrequencyResponseCorrection(rawPsd, calibrationRouteMatched ? requestedProfile : null);
-  const fit = fitPowerLaw(psd.frequencies, psd.power, fitRange[0], maxFrequency);
+  const correctedPsd = applyFrequencyResponseCorrection(rawPsd, calibrationRouteMatched ? requestedProfile : null);
+  const psd = rawPsd;
+  // Raw measurement is always the original continuous PSD regression. Neither
+  // calibration nor acoustic diagnostics may substitute a different beta.
+  const fit = fitPowerLaw(rawPsd.frequencies, rawPsd.power, fitRange[0], maxFrequency);
+  const correctedEstimate = correctedPsd.corrected
+    ? fitPowerLaw(correctedPsd.frequencies, correctedPsd.power, fitRange[0], maxFrequency) : null;
   const input = calculateInputMetrics(samples);
   const flatness = spectralFlatness(psd.frequencies, psd.power, fitRange[0], maxFrequency);
   const tonality = tonalityDiagnostics(psd.frequencies, psd.power, fitRange[0], maxFrequency, fit, options.previousProminentPeakFrequencies || []);
   const modelAdequacy = modelAdequacyDiagnostics(psd.frequencies, psd.power, fitRange[0], maxFrequency);
   const durationSeconds = samples.length / sampleRate;
   const quality = qualityGate({ durationSeconds, input, flatness, fit, tonality, modelAdequacy, temporalSd: options.temporalSd || 0 });
+  // Core measurements contain no acquisition history or display transformations.
+  // Persistence and temporal decisions remain explicit contextual evidence.
+  const measurement = { input, rawFit: { ...fit }, rawFlatness: flatness,
+    tonality: { ...tonality, persistentPeakCount: 0 }, modelAdequacy };
+  const coreDecision = qualityGate({ durationSeconds, input, flatness, fit,
+    tonality: measurement.tonality, modelAdequacy, temporalSd: 0 });
   return {
     appVersion: APP_VERSION,
     analysisEngineVersion: ENGINE_VERSION,
@@ -753,11 +794,34 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     welchOverlap: options.overlap ?? WELCH_OVERLAP,
     welchSegments: rawPsd.segments,
     welchAvailableSegments: rawPsd.availableSegments,
+    welchConfiguration: {
+      requestedFftSize: options.fftSize || FFT_SIZE, fftSize: rawPsd.fftSize,
+      overlap: options.overlap ?? WELCH_OVERLAP, hopSamples: rawPsd.hopSamples ?? null,
+      maxSegments: Number.isFinite(options.maxWelchSegments) ? options.maxWelchSegments : null,
+      segments: rawPsd.segments, availableSegments: rawPsd.availableSegments,
+      segmentStarts: rawPsd.segmentStarts || [], window: "symmetric-Hann",
+      windowEnergy: rawPsd.windowEnergy ?? null, detrend: "per-segment-mean",
+      scaling: "one-sided-density-per-Hz", selection: "evenly-distributed-including-endpoints",
+    },
+    requestedFitRange: [...fitRange],
     fitRange: [fitRange[0], maxFrequency],
     analysisMode: options.analysisMode || "balanced",
     analysisWindowSeconds: durationSeconds,
     temporalSd: Number(options.temporalSd) || 0,
     beta: fit.beta,
+    rawMeasuredBeta: fit.beta,
+    rawMeasurement: { ...fit, basis: "original-continuous-PSD", weighting: "equal-FFT-ordinates" },
+    measurement,
+    coreDecision,
+    qualityContext: {
+      temporalSd: Number.isFinite(options.temporalSd) ? options.temporalSd : null,
+      temporalObservationCount: options.temporalObservationCount ?? null,
+      temporalSelection: options.temporalSelection || "not-specified",
+      missingTemporalPolicy: "zero used by existing gate; not evidence of observed stability",
+      previousProminentPeakFrequencies: [...(options.previousProminentPeakFrequencies || [])],
+      persistentPeakCount: tonality.persistentPeakCount,
+    },
+    correctedEstimate,
     rawSlope: fit.slope,
     intercept: fit.intercept,
     r2: fit.r2,
@@ -768,6 +832,7 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     rms: input.rms,
     dbfs: input.dbfs,
     peak: input.peak,
+    pcm: pcmMetrics(samples),
     clippingRatio: input.clippingRatio,
     nearClipRatio: input.nearClipRatio,
     plateauRatio: input.plateauRatio,
@@ -807,6 +872,12 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     abruptBreakpointRelativeImprovement: modelAdequacy.abruptBreakpointRelativeImprovement,
     abruptBreakpointEvidence: modelAdequacy.abruptBreakpointEvidence,
     abruptBreakpointSupportBins: modelAdequacy.abruptBreakpointSupportBins,
+    abruptBreakpointSupportOctaves: modelAdequacy.abruptBreakpointSupportOctaves,
+    abruptBreakpointEffectiveSupportBins: modelAdequacy.abruptBreakpointEffectiveSupportBins,
+    abruptBreakpointMinimumNovelty: modelAdequacy.abruptBreakpointMinimumNovelty,
+    rejectedAdjustedBreakpoints: modelAdequacy.rejectedAdjustedBreakpoints,
+    smoothAcousticCurvature: { magnitudeDb: modelAdequacy.smoothCurvatureMagnitudeDb, residualRmseDb: modelAdequacy.smoothResidualRmseDb, basis: "robust-degree-5-log-frequency-diagnostic-only" },
+    breakpointDiagnostics: modelAdequacy,
     modelAdequacyStatus: quality.modelAdequacyStatus || "not-evaluated",
     modelAdequacyDetail: quality.modelAdequacyDetail || "Model adequacy was not evaluated because an earlier quality gate fired.",
     classification: quality.label,
@@ -817,11 +888,11 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     canonicalColor: quality.canonical?.label || null,
     canonicalBeta: quality.canonical?.beta ?? null,
     canonicalDistance: quality.distance ?? null,
-    calibrationProfile: psd.calibrationProfile,
-    calibration: calibrationSnapshot(requestedProfile, psd.corrected),
+    calibrationProfile: correctedPsd.calibrationProfile,
+    calibration: calibrationSnapshot(requestedProfile, correctedPsd.corrected),
     calibrationRouteMatched,
     calibrationNotAppliedReason: requestedProfile && !calibrationRouteMatched ? "Calibration profile did not match the active input route." : null,
-    corrected: psd.corrected,
+    corrected: correctedPsd.corrected,
     scalarGainDb: Number(options.scalarGainDb) || 0,
     inputRouteLabel: options.inputRouteLabel || null,
     microphoneSettings: sanitizeSettings(options.microphoneSettings),
@@ -949,9 +1020,13 @@ export class SessionAccumulator {
     this.durationSeconds = 0;
     this.timeline = [];
     this.observations = { count: 0, betaMean: 0, betaM2: 0, rmseSum: 0, r2Sum: 0, flatnessSum: 0 };
+    this.inputMeter = new PcmMeter();
+    this.activityMeter = new PcmMeter();
+    this.lastActivityPcm = null;
   }
 
   addAudio(samples, fallback = null) {
+    this.inputMeter.add(samples);
     let offset = 0;
     while (offset < samples.length) {
       const count = Math.min(samples.length - offset, this.frameSize - this.pendingLength);
@@ -963,6 +1038,8 @@ export class SessionAccumulator {
   }
 
   commitFrame(samples, durationSeconds, fallback) {
+    this.activityMeter.add(samples);
+    this.lastActivityPcm = pcmMetrics(samples);
     const classified = activityState(samples, fallback);
     const startSeconds = this.durationSeconds;
     const endSeconds = startSeconds + durationSeconds;
@@ -1028,6 +1105,7 @@ export class SessionAccumulator {
       summary.spectralFlatnessMean = stats.flatnessSum / stats.count;
     }
     summary.aggregateObservationCount = stats.count;
+    summary.pcmDiagnostics = { sessionAccumulator: this.inputMeter.snapshot(), activityTimeline: this.activityMeter.snapshot(), lastActivityFrame: this.lastActivityPcm };
     summary.statisticsCoverFullSession = true;
     summary.timelineStateDurations = timelineStateDurations(colorTimeline);
     summary.timelineCoversFullSession = Math.abs((colorTimeline.at(-1)?.endSeconds || 0) - this.durationSeconds) <= 1 / this.sampleRate;
@@ -1064,36 +1142,11 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
   const reliableSummary = summarize(observations.filter((item) => item.reliable).map((item) => item.beta));
   let gated = qualityGate({
     durationSeconds: overall.durationSeconds,
-    input: { rms: overall.rms, dbfs: overall.dbfs, clippingRatio: overall.clippingRatio, nearClipRatio: overall.nearClipRatio, peak: overall.peak, limitingSuspected: overall.limitingSuspected, nonFiniteRatio: overall.nonFiniteRatio },
-    flatness: overall.spectralFlatness,
-    fit: { beta: overall.beta, rmseDb: overall.rmseDb },
-    tonality: {
-      slopeNormalizedFlatness: overall.slopeNormalizedFlatness,
-      maxPeakProminenceDb: overall.maxPeakProminenceDb,
-      tonalPowerRatio: overall.tonalPowerRatio,
-      prominentPeakCount: overall.prominentPeakCount,
-      persistentPeakCount: overall.persistentPeakCount,
-      harmonicPeakCount: overall.harmonicPeakCount,
-      harmonicEvidence: overall.harmonicEvidence,
-      broadbandOccupancy: overall.broadbandOccupancy,
-    },
-    modelAdequacy: {
-      segmentedSlopeDelta: overall.segmentedSlopeDelta,
-      logBinnedRmseDb: overall.logBinnedRmseDb,
-      maxBreakpointSlopeDelta: overall.maxBreakpointSlopeDelta,
-      piecewiseImprovementDb: overall.piecewiseImprovementDb,
-      piecewiseRelativeImprovement: overall.piecewiseRelativeImprovement,
-      breakpointEvidence: overall.breakpointEvidence,
-      smoothCurvatureMagnitudeDb: overall.smoothCurvatureMagnitudeDb,
-      smoothCurvatureRmseDb: overall.smoothCurvatureRmseDb,
-      smoothResidualRmseDb: overall.smoothResidualRmseDb,
-      smoothResidualMadDb: overall.smoothResidualMadDb,
-      abruptBreakpointSlopeDelta: overall.abruptBreakpointSlopeDelta,
-      abruptBreakpointFrequency: overall.abruptBreakpointFrequency,
-      abruptBreakpointImprovementDb: overall.abruptBreakpointImprovementDb,
-      abruptBreakpointRelativeImprovement: overall.abruptBreakpointRelativeImprovement,
-      abruptBreakpointEvidence: overall.abruptBreakpointEvidence,
-    },
+    input: overall.measurement.input,
+    flatness: overall.measurement.rawFlatness,
+    fit: overall.measurement.rawFit,
+    tonality: { ...overall.measurement.tonality, persistentPeakCount: overall.persistentPeakCount },
+    modelAdequacy: overall.measurement.modelAdequacy,
     temporalSd: reliableSummary.sd || 0,
   });
   const activityTimeline = buildActivityTimeline(samples, sampleRate, observations, options.activityFrameSeconds || 0.5);
@@ -1119,6 +1172,11 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
     temporalBetaSd: reliableSummary.sd,
     temporalBetaMedian: reliableSummary.median,
     temporalBeta: observations,
+    qualityContext: { ...overall.qualityContext, temporalSd: reliableSummary.sd,
+      temporalObservationCount: observations.filter((item) => item.reliable).length,
+      temporalSelection: "reliable temporal windows only", temporalWindowSeconds: windowSeconds,
+      temporalStepSeconds: stepSeconds, temporalMaxWelchSegments: Math.min(options.maxWelchSegments || 24, 24),
+      observationTimeBasis: "relative-to-measurement-window", activityFrameSeconds: options.activityFrameSeconds || 0.5 },
     colorTimeline: activityTimeline,
     sessionSummary,
   };

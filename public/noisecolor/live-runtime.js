@@ -7,6 +7,72 @@ export const MODE_CONFIG = Object.freeze({
   stable: Object.freeze({ fastSeconds: 3, stableSeconds: 12, fastEveryMs: 750, stableEveryMs: 1500 }),
 });
 
+// One dispatcher owns the worker. Independent 500/1000 ms timers let the fast
+// callback win every collision and indefinitely starve stable observations.
+export class LiveAnalysisScheduler {
+  constructor(config) {
+    this.config = config;
+    this.lastFast = -Infinity;
+    this.lastStable = -Infinity;
+  }
+
+  next(nowMs, availableSeconds, busy = false) {
+    if (busy) return null; // A skipped deadline remains due.
+    if (availableSeconds >= this.config.stableSeconds && nowMs - this.lastStable >= this.config.stableEveryMs) {
+      this.lastStable = nowMs;
+      return "stable";
+    }
+    if (availableSeconds >= Math.min(1.5, this.config.fastSeconds) && nowMs - this.lastFast >= this.config.fastEveryMs) {
+      this.lastFast = nowMs;
+      return "fast";
+    }
+    return null;
+  }
+}
+
+export function sessionSignalPercentages(percentages = {}) {
+  return { lowSignal: percentages.silence || 0, awaitingAnalysis: percentages.insufficient || 0 };
+}
+
+export function liveWindowProvenance(sampleCount, capturedSampleCount, sampleRate) {
+  if (!Number.isSafeInteger(sampleCount) || sampleCount < 0 || !Number.isSafeInteger(capturedSampleCount) || capturedSampleCount < sampleCount || !(sampleRate > 0)) throw new Error("Invalid live sample boundary.");
+  const analysisStartSample = capturedSampleCount - sampleCount;
+  return { analysisStartSample, analysisStartSeconds: analysisStartSample / sampleRate, sourceDurationSeconds: capturedSampleCount / sampleRate };
+}
+
+// Pauses are missing acquisition time, not zero-valued PCM. A resumed recording
+// is analyzed from its final contiguous segment, never across a hidden splice.
+export class CaptureContinuity {
+  constructor() { this.paused = false; this.segmentStartSample = 0; this.events = []; }
+  pause(kind, sampleOffset, elapsedSeconds) {
+    if (this.paused) return false;
+    this.paused = true;
+    this.events.push({ kind, sampleOffset, elapsedSeconds, recovered: false });
+    return true;
+  }
+  resume(sampleOffset, elapsedSeconds) {
+    if (!this.paused) return false;
+    const event = this.events.at(-1);
+    event.recovered = true;
+    event.resumeSampleOffset = sampleOffset;
+    event.resumeElapsedSeconds = elapsedSeconds;
+    event.gapSeconds = Math.max(0, elapsedSeconds - event.elapsedSeconds);
+    this.segmentStartSample = sampleOffset;
+    this.paused = false;
+    return true;
+  }
+  finalSegmentLength(capturedSampleCount, retainedLength) {
+    return Math.max(0, Math.min(retainedLength, capturedSampleCount - this.segmentStartSample));
+  }
+}
+
+export function capturePcm(samples, { rolling, sessionAccumulator, recordingBuffer, trace, fallback }) {
+  trace.record("captureSamples", samples);
+  rolling.push(samples);
+  sessionAccumulator.addAudio(samples, fallback);
+  recordingBuffer?.push(samples);
+}
+
 export class RollingBuffer {
   constructor(capacity) {
     if (!Number.isInteger(capacity) || capacity <= 0) throw new RangeError("Rolling-buffer capacity must be a positive integer.");

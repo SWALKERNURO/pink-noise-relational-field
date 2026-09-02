@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
+import vm from "node:vm";
+import * as reference067 from "./fixtures/noisecolor-v067-beta-reference.mjs";
 import {
   APP_VERSION,
   ENGINE_VERSION,
@@ -11,12 +13,20 @@ import {
   buildActivityTimeline,
   buildColorTimeline,
   fftInPlace,
+  fitPowerLaw,
+  modelAdequacyDiagnostics,
   summarizeSession,
   thirdOctaveBands,
   welchPSD,
 } from "../public/noisecolor/analysis-engine.js";
 import { ColorStateMachine } from "../public/noisecolor/live-state.js";
-import { MODE_CONFIG, RollingBuffer, selectBoundedAnalysisWindow } from "../public/noisecolor/live-runtime.js";
+import { analyzePcm } from "../public/noisecolor/analysis-pipeline.js";
+import { normalizePcm, mixToMono, decodePcmWavTail } from "../public/noisecolor/pcm-input.js";
+import { CaptureContinuity, liveWindowProvenance } from "../public/noisecolor/live-runtime.js";
+import { canExportDiagnostic, createDiagnosticBundle, replayDiagnosticSpectrum, browserDiagnosticInfo } from "../public/noisecolor/diagnostic-bundle.js";
+import { sanitizeMetadata, sanitizeAudioSettings } from "../public/noisecolor/privacy.js";
+import { capturePcm, LiveAnalysisScheduler, MODE_CONFIG, RollingBuffer, selectBoundedAnalysisWindow, sessionSignalPercentages } from "../public/noisecolor/live-runtime.js";
+import { PcmMeter, PcmTrace, pcmMetrics } from "../public/noisecolor/pcm-diagnostics.js";
 import { compactMeasurement, historyPaginationState, HISTORY_PAGE_SIZE, HISTORY_RETENTION_LIMIT } from "../public/noisecolor/history.js";
 import { MAX_DECODE_WORKING_BYTES, assessCompressedUploadSafety, estimateCompressedDecodePeakBytes, inspectCompressedLayout, preflightCompressedUpload } from "../public/noisecolor/upload-safety.js";
 import { MicrophoneStartupLock, isMicrophoneStartupCancellation } from "../public/noisecolor/microphone-startup.js";
@@ -213,6 +223,344 @@ function twoRegimeNoise({ sampleRate = 16000, size = 65536, seed = 73, breakpoin
 
 const analysisOptions = { fitRange: [100, 7000], analysisMode: "test" };
 
+test("recovery: interruptions preserve boundaries and never splice pre/post-pause PCM into a fit", () => {
+  const continuity = new CaptureContinuity();
+  const recorded = new RollingBuffer(160000);
+  const before = coloredNoise(2);
+  const after = coloredNoise(0);
+  recorded.push(before);
+  assert.equal(continuity.pause("context-suspended", before.length, 4.1), true);
+  assert.equal(continuity.pause("track-muted", before.length, 4.2), false);
+  assert.equal(continuity.finalSegmentLength(before.length, recorded.length), before.length);
+  assert.equal(continuity.resume(before.length, 10.1), true);
+  recorded.push(after);
+  const count = before.length + after.length;
+  const selected = recorded.latest(continuity.finalSegmentLength(count, recorded.length));
+  assert.deepEqual(selected, after);
+  assert.equal(continuity.events[0].gapSeconds, 6);
+  assert.equal(continuity.events[0].recovered, true);
+  const actual = analyzePcm({ samples: selected, sampleRate: 16000, path: "recording", options: liveWindowProvenance(selected.length, count, 16000) });
+  const expected = analyzePcm({ samples: after, sampleRate: 16000, path: "upload" });
+  assert.deepEqual(actual.measurement, expected.measurement);
+  assert.equal(actual.measurementWindow.startSample, before.length);
+});
+
+test("recovery: worklet reset acknowledgement discards a partial pre-interruption packet", async () => {
+  let Processor;
+  const messages = [];
+  const source = (await readFile(new URL("../public/noisecolor/audio-worklet.js", import.meta.url), "utf8")).replace(/^import .*;\r?\n/gm, "");
+  vm.runInNewContext(source, { Float32Array, PcmMeter, pcmMetrics,
+    AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (data) => messages.push(data) }; } },
+    registerProcessor: (_, implementation) => { Processor = implementation; } });
+  const processor = new Processor();
+  processor.process([[new Float32Array(128).fill(0.4)]]);
+  processor.port.onmessage({ data: { type: "reset-packet", token: 123 } });
+  assert.equal(messages[0].type, "packet-reset");
+  assert.equal(messages[0].token, 123);
+  processor.process([[new Float32Array(2048).fill(0.1)]]);
+  assert.deepEqual(messages[1].samples, new Float32Array(2048).fill(0.1));
+});
+
+function floatWav(channels, sampleRate) {
+  const samples = channels[0].length;
+  const buffer = new ArrayBuffer(44 + samples * channels.length * 4);
+  const view = new DataView(buffer);
+  const ascii = (offset, text) => [...text].forEach((c, i) => view.setUint8(offset + i, c.charCodeAt(0)));
+  ascii(0, "RIFF"); view.setUint32(4, buffer.byteLength - 8, true); ascii(8, "WAVEfmt ");
+  view.setUint32(16, 16, true); view.setUint16(20, 3, true); view.setUint16(22, channels.length, true);
+  view.setUint32(24, sampleRate, true); view.setUint32(28, sampleRate * channels.length * 4, true);
+  view.setUint16(32, channels.length * 4, true); view.setUint16(34, 32, true);
+  ascii(36, "data"); view.setUint32(40, samples * channels.length * 4, true);
+  for (let i = 0; i < samples; i += 1) channels.forEach((data, c) => view.setFloat32(44 + (i * channels.length + c) * 4, data[i], true));
+  return buffer;
+}
+
+test("recovery: actual upload/record/live adapters and worker yield exactly identical core science", async () => {
+  const fixtures = [
+    ...[-2, -1, 0, 1, 2].map((beta) => coloredNoise(beta, { seed: 7000 + beta, rms: 10 ** (-18 / 20) })),
+    ...[0, 1, 2].map((beta) => frequencyShapedColoredNoise(beta, { seed: 7100 + beta, responseDb: (f) => combinedAcousticEq(f) + acousticResonanceResponse(f) })),
+    twoRegimeNoise({ breakpoint: 3000 }),
+    Float32Array.from({ length: 65536 }, (_, i) => 0.18 * Math.sin(2 * Math.PI * 440 * i / 16000)),
+    new Float32Array(65536),
+  ];
+  let receive, response;
+  const worker = (await readFile(new URL("../public/noisecolor/analysis-worker.js", import.meta.url), "utf8")).replace(/^import .*;\r?\n/gm, "");
+  vm.runInNewContext(worker, { Float32Array, analyzePcm, normalizePcm, buildSpectrogram: () => null,
+    self: { addEventListener: (_, fn) => { receive = fn; }, postMessage: (data) => { response = data; } } });
+  for (const source of fixtures) {
+    const pcm = mixToMono({ length: source.length, numberOfChannels: 1, getChannelData: () => source });
+    const rolling = new RollingBuffer(source.length), recordingBuffer = new RollingBuffer(source.length);
+    const sessionAccumulator = new SessionAccumulator(16000), trace = new PcmTrace();
+    for (let i = 0; i < pcm.length; i += 2048) capturePcm(pcm.subarray(i, i + 2048), { rolling, recordingBuffer, sessionAccumulator, trace });
+    const paths = [
+      ["uploaded-file", "analyze-recording", decodePcmWavTail(floatWav([source], 16000)).samples],
+      ["recorded-microphone", "analyze-recording", recordingBuffer.latest()],
+      ["live", "analyze-live", rolling.latest()],
+    ];
+    const results = paths.map(([sourceType, type, samples], i) => {
+      assert.deepEqual(samples, source);
+      receive({ data: structuredClone({ id: i, type, samples, sampleRate: 16000, options: { ...analysisOptions, sourceType, maxWelchSegments: 48 } }, { transfer: [samples.buffer] }) });
+      assert.equal(response.error, undefined);
+      return response.result;
+    });
+    for (const result of results) {
+      assert.deepEqual(result.measurement, results[0].measurement, "input RMS/dBFS, fit, flatness, tonality and ALL model diagnostics");
+      assert.deepEqual(result.pcm, results[0].pcm);
+      assert.deepEqual(result.psd, results[0].psd);
+      assert.deepEqual(result.welchConfiguration, results[0].welchConfiguration);
+      assert.deepEqual(result.coreDecision, results[0].coreDecision);
+      assert.equal(result.rawMeasuredBeta, results[0].rawMeasuredBeta);
+      assert.equal(result.measurementWindow.sampleCount, source.length);
+    }
+    assert.deepEqual(results.map((r) => r.acquisition.path), ["upload", "recording", "live"]);
+    assert.deepEqual(results[0].qualityContext, results[1].qualityContext);
+    assert.equal(results[2].qualityContext.temporalSd, null, "missing live history is not asserted to be observed zero SD");
+  }
+});
+
+test("recovery: multichannel WAV and browser decoder round mono once and preserve sample-rate provenance", () => {
+  const channels = Array.from({ length: 3 }, (_, c) => Float32Array.from({ length: 400 }, (_, i) => Math.sin(i * (c + 1)) * (0.31 + c * 0.11)));
+  for (const rate of [8000, 16000, 44100, 48000, 96000]) {
+    const wav = decodePcmWavTail(floatWav(channels, rate));
+    const decoded = mixToMono({ length: 400, numberOfChannels: 3, getChannelData: (c) => channels[c] });
+    assert.deepEqual(wav.samples, decoded);
+    assert.equal(wav.sampleRate, rate);
+    assert.equal(wav.acquisition.resampled, false);
+    const result = analyzePcm({ samples: decoded, sampleRate: rate, path: "upload" });
+    assert.equal(result.fitRange[1], Math.min(8000, rate * 0.48));
+  }
+  const malformed = floatWav(channels, 16000);
+  new DataView(malformed).setUint16(32, 2, true);
+  assert.throws(() => decodePcmWavTail(malformed), /alignment/);
+  assert.throws(() => normalizePcm(new Int16Array(20)), /float PCM/);
+  assert.throws(() => analyzePcm({ samples: channels[0], sampleRate: NaN, path: "live" }), /sample rate/);
+  assert.throws(() => analyzePcm({ samples: channels[0], sampleRate: 16000, path: "live", options: { overlap: 1 } }), /Welch/);
+});
+
+test("recovery: window duration, bounded tails and context differences are explicit, never raw-beta corrections", () => {
+  const source = coloredNoise(1, { size: 262144, seed: 7310 });
+  const live = new RollingBuffer(128000), recorded = new RollingBuffer(source.length);
+  live.push(source); recorded.push(source);
+  const selected = live.latest();
+  const windowOptions = liveWindowProvenance(selected.length, source.length, 16000);
+  const liveResult = analyzePcm({ samples: selected, sampleRate: 16000, path: "live", options: windowOptions });
+  const tail = decodePcmWavTail(floatWav([source], 16000), 8);
+  const upload = analyzePcm({ samples: tail.samples, sampleRate: 16000, path: "upload", options: tail });
+  assert.deepEqual(liveResult.psd, upload.psd);
+  assert.deepEqual(liveResult.measurement, upload.measurement);
+  assert.equal(liveResult.measurementWindow.startSample, source.length - 128000);
+  assert.equal(liveResult.measurementWindow.endSample, source.length);
+  const full = analyzePcm({ samples: recorded.latest(), sampleRate: 16000, path: "recording" });
+  assert.notDeepEqual(full.psd, liveResult.psd, "different PCM intervals are intentionally NOT equivalent");
+  assert.equal(full.measurementWindow.startSample, 0);
+  const fast = analyzePcm({ samples: selected.slice(-32000), sampleRate: 16000, path: "live", options: { maxWelchSegments: 24, job: "fast-preview" } });
+  assert.equal(fast.welchConfiguration.maxSegments, 24);
+  assert.equal(fast.measurementWindow.job, "fast-preview");
+  assert.notDeepEqual(fast.psd, liveResult.psd);
+  const unstable = analyzePcm({ samples: selected, sampleRate: 16000, path: "live", options: { ...windowOptions, temporalSd: 0.8, temporalObservationCount: 10 } });
+  assert.deepEqual(unstable.measurement, liveResult.measurement);
+  assert.equal(unstable.state, "unstable");
+  const replayPsd = reference067.welchPSD(selected, 16000, 4096, 0.5, 48);
+  assert.equal(liveResult.rawMeasuredBeta, reference067.fitPowerLaw(replayPsd.frequencies, replayPsd.power, ...liveResult.fitRange).beta);
+  assert.deepEqual(liveResult.welchConfiguration.segmentStarts.map((start) => start % liveResult.welchConfiguration.hopSamples), Array(48).fill(0));
+});
+
+test("recovery: diagnostic bundle is exact, closed-schema, identifier-free, audio-free and independently replayable", () => {
+  const source = frequencyShapedColoredNoise(1, { seed: 7320, responseDb: (f) => combinedAcousticEq(f) + acousticResonanceResponse(f) });
+  const result = analyzePcm({ samples: source, sampleRate: 16000, path: "recording", options: {
+    microphoneSettings: { sampleRate: 16000, deviceId: "SECRET", groupId: "SECRET", nested: { deviceId: "SECRET" }, noiseSuppression: false },
+    calibrationProfile: { name: "PRIVATE PROFILE NAME", routeId: "SECRET", points: [{ frequency: 100, correctionDb: 0 }, { frequency: 8000, correctionDb: 8 }] },
+    calibrationRouteKey: "SECRET",
+    acquisition: { browser: { family: "Chrome", version: "100", deviceId: "SECRET" }, rawSamples: source, deviceId: "SECRET" },
+    pcmDiagnostics: { captureInput: { ...pcmMetrics(source), groupId: "SECRET" }, unexpected: { deviceId: "SECRET" } },
+    sourceFilename: "PRIVATE AUDIO NAME",
+  } });
+  result.rawSamples = source; result.audio = Array.from(source);
+  result.deviceId = "SECRET"; result.qualityContext.nested = { groupId: "SECRET" };
+  const bundle = createDiagnosticBundle(result, { session: { betaMean: -999, deviceId: "SECRET" } });
+  const text = JSON.stringify(bundle);
+  assert.doesNotMatch(text, /SECRET|PRIVATE|deviceId|groupId|rawSamples|audioBuffer|sourceFilename/);
+  assert.equal(bundle.privacy.rawAudioIncluded, false);
+  assert.equal(bundle.rawMeasurement.rawMeasuredBeta, result.rawMeasuredBeta);
+  assert.equal(bundle.temporal.sessionAggregates.betaMean, -999, "session mean is distinct from raw measurement");
+  assert.deepEqual(bundle.psd.powersPerHz, result.psd.power);
+  assert.equal(bundle.acquisition.audioTrackSettings.noiseSuppression, false);
+  assert.equal(bundle.calibration.rawMeasurementCorrected, false);
+  assert.equal(bundle.calibration.auxiliaryEstimateAvailable, true);
+  assert.deepEqual(bundle.calibration.points, result.calibration.points);
+  const replay = replayDiagnosticSpectrum(JSON.parse(text));
+  assert.deepEqual(replay.rawFit, result.measurement.rawFit);
+  assert.equal(replay.rawFlatness, result.spectralFlatness);
+  assert.deepEqual(sanitizeMetadata(replay.modelAdequacy), sanitizeMetadata(result.breakpointDiagnostics));
+  assert.deepEqual(replay.tonality, result.measurement.tonality);
+  result.psd.power[1] = 123;
+  assert.notEqual(bundle.psd.powersPerHz[1], 123, "bundle cannot be mutated by a later measurement");
+  assert.equal(canExportDiagnostic(compactMeasurement(result)), false);
+  assert.throws(() => createDiagnosticBundle(compactMeasurement(result)), /unavailable/);
+  assert.throws(() => replayDiagnosticSpectrum({ ...bundle, psd: { frequenciesHz: [0, 1], powersPerHz: [null, 1] } }), /non-finite/);
+  assert.deepEqual(sanitizeAudioSettings({ deviceId: "SECRET", sampleRate: { groupId: "SECRET" }, channelCount: 1 }), { channelCount: 1 });
+  assert.doesNotMatch(JSON.stringify(compactMeasurement(result)), /SECRET|deviceId|groupId|rawSamples/);
+  const browser = browserDiagnosticInfo({ userAgent: "Mozilla/5.0 (PRIVATE DEVICE) Chrome/123.4.5 Safari/123" }, { secureContext: true });
+  assert.deepEqual(browser, { family: "Chrome", version: "123.4.5", secureContext: true, standalone: false });
+  assert.equal(browserDiagnosticInfo({ userAgent: "Chrome/123.0 Safari/1 Edg/124.0" }).family, "Edge");
+  assert.equal(browserDiagnosticInfo({ userAgent: "Mobile CriOS/125.0 Safari/1" }).family, "Chrome");
+  assert.equal(browserDiagnosticInfo({ userAgent: "Mobile FxiOS/126.0 Safari/1" }).family, "Firefox");
+});
+
+test("recovery: acoustic confidence remains engine-owned and never upgraded by live smoothing", () => {
+  const machine = new ColorStateMachine({ requiredObservations: 1 });
+  const acoustic = analyzeSamples(frequencyShapedColoredNoise(1, { responseDb: combinedAcousticEq }), 16000, analysisOptions);
+  assert.equal(acoustic.confidence, "Moderate");
+  assert.equal(machine.update(acoustic).confidence, "Moderate");
+  assert.equal(machine.update({ ...acoustic, confidence: "Low" }).confidence, "Low");
+  assert.equal(machine.update({ ...acoustic, confidence: "None" }).confidence, "None");
+});
+
+test("recovery: insufficient and invalid diagnostics never masquerade as a complete replay", () => {
+  for (const samples of [new Float32Array(), Float32Array.of(NaN, Infinity), new Float32Array(100)]) {
+    const result = analyzePcm({ samples, sampleRate: 16000, path: "live" });
+    assert.equal(result.reliable, false);
+    const bundle = createDiagnosticBundle(result);
+    assert.equal(bundle.classification.reliable, false);
+    assert.throws(() => replayDiagnosticSpectrum(bundle), /incomplete/);
+    assert.doesNotThrow(() => JSON.stringify(bundle));
+  }
+});
+
+test("raw PSD and beta exactly match frozen pre-v0.6.8 estimator across source paths", (t) => {
+  const fixtures = [
+    ...[0, 1, 2].map((beta) => coloredNoise(beta, { seed: 6900 + beta })),
+    frequencyShapedColoredNoise(1, { seed: 6904, responseDb: (f) => combinedAcousticEq(f) + acousticResonanceResponse(f) }),
+    frequencyShapedColoredNoise(1, { seed: 6905, responseDb: (f) => -10 * Math.log10(1 + (f / 1010) ** 4) }),
+  ];
+  for (const samples of fixtures) {
+    const options = { ...analysisOptions, maxWelchSegments: 48 };
+    const oldPsd = reference067.welchPSD(samples, 16000, 4096, 0.5, 48);
+    const oldFit = reference067.fitPowerLaw(oldPsd.frequencies, oldPsd.power, ...options.fitRange);
+    t.diagnostic(`Frozen/current raw β: ${oldFit.beta.toFixed(12)}; exact equality checked in all source paths`);
+    const psd = welchPSD(samples, 16000, 4096, 0.5, 48);
+    assert.deepEqual(psd.power, oldPsd.power, "Welch normalization and segment selection are unchanged");
+    assert.equal(fitPowerLaw(psd.frequencies, psd.power, ...options.fitRange).beta, oldFit.beta);
+    const before = new Float64Array(psd.power);
+    modelAdequacyDiagnostics(psd.frequencies, psd.power, ...options.fitRange);
+    assert.deepEqual(psd.power, before, "curvature diagnostics must not mutate the PSD");
+    for (const sourceType of ["live", "recorded-microphone", "uploaded-file"]) {
+      const result = sourceType === "live" ? analyzeSamples(samples, 16000, { ...options, sourceType })
+        : analyzeRecording(samples, 16000, { ...options, sourceType });
+      assert.equal(result.rawMeasuredBeta, oldFit.beta, sourceType);
+      assert.equal(result.beta, oldFit.beta);
+      assert.deepEqual(result.psd.power, Array.from(oldPsd.power));
+      assert.equal(result.rawMeasurement.basis, "original-continuous-PSD");
+      if (samples === fixtures.at(-1)) {
+        assert.ok(Math.abs(result.rawMeasuredBeta - 3.74) < 0.03, "synthetic low-pass coloration can steepen a pink source's measured PSD");
+        assert.equal(result.state, "mixed", "do not relabel a truly steep measured trend as pink");
+      }
+    }
+  }
+});
+
+test("adjusted hinges require bandwidth, rank, and consistency with original slope evidence", () => {
+  const frequencies = Float64Array.from({ length: 2049 }, (_, i) => i * 44100 / 4096);
+  const power = Float64Array.from(frequencies, (f) => f > 0 ? f ** -1.36 * 10 ** ((
+    8.8 * Math.sin(2 * Math.PI * normalizedAcousticFrequency(f))
+    + 7 * Math.exp(-0.5 * (Math.log2(f / 3854) / 0.22) ** 2)
+  ) / 10) : 0);
+  const result = modelAdequacyDiagnostics(frequencies, power, 100, 8000);
+  assert.ok(result.rejectedAdjustedBreakpoints.some((item) => item.reason === "polynomial-hinge-cancellation"));
+  assert.ok(result.rejectedAdjustedBreakpoints.some((item) => item.reason === "insufficient-bandwidth"));
+  assert.ok(result.abruptBreakpointSupportOctaves >= 0.25);
+  assert.ok(result.abruptBreakpointMinimumNovelty >= 0.01);
+  assert.ok(result.abruptBreakpointEffectiveSupportBins >= 2.5);
+  const rescaled = modelAdequacyDiagnostics(Float64Array.from(frequencies, (f) => f * 2), Float64Array.from(power, (p) => p * 1e-6), 200, 16000);
+  assert.ok(Math.abs(rescaled.abruptBreakpointSlopeDelta - result.abruptBreakpointSlopeDelta) < 1e-8);
+  assert.ok(Math.abs(rescaled.smoothCurvatureMagnitudeDb - result.smoothCurvatureMagnitudeDb) < 1e-8);
+  const narrow = modelAdequacyDiagnostics(frequencies, power, 3800, 3900);
+  assert.equal(narrow.abruptBreakpointEvidence, 0, "insufficient logarithmic bandwidth must never produce an accepted hinge");
+  for (const item of result.rejectedAdjustedBreakpoints) {
+    assert.notEqual(result.abruptBreakpointFrequency, item.frequency, "invalid hinge must not win gate evidence");
+  }
+});
+
+test("live dispatcher prevents deterministic fast-timer starvation without calling active PCM silence", () => {
+  // Reproduce the old fast-first 500/1000 ms collision with a 100 ms worker.
+  let busyUntil = 0;
+  let legacyStable = 0;
+  for (let time = 500; time <= 28000; time += 500) {
+    if (time >= busyUntil) busyUntil = time + 100;
+    if (time % 1000 === 0 && time >= busyUntil) legacyStable += 1;
+  }
+  assert.equal(legacyStable, 0);
+  for (const config of Object.values(MODE_CONFIG)) {
+    const scheduler = new LiveAnalysisScheduler(config);
+    let stable = 0;
+    busyUntil = 0;
+    for (let time = 100; time <= 28000; time += 100) {
+      const task = scheduler.next(time, time / 1000, time < busyUntil);
+      if (task) busyUntil = time + 300;
+      if (task === "stable") stable += 1;
+    }
+    assert.ok(stable >= 8, `stable observations: ${stable}`);
+  }
+  assert.deepEqual(sessionSignalPercentages({ insufficient: 100, silence: 0 }), { lowSignal: 0, awaitingAnalysis: 100 });
+});
+
+test("injected -18 dBFS PCM survives worklet transfer, live buffers, activity frames, and worker analysis", async () => {
+  const samples = coloredNoise(1, { size: 524288, seed: 6909, rms: 10 ** (-18 / 20) }).slice(0, 448000);
+  const rolling = new RollingBuffer(samples.length);
+  const recordingBuffer = new RollingBuffer(samples.length);
+  const sessionAccumulator = new SessionAccumulator(16000);
+  const trace = new PcmTrace();
+  const messages = [];
+  let Processor;
+  const worklet = (await readFile(new URL("../public/noisecolor/audio-worklet.js", import.meta.url), "utf8")).replace(/^import .*;\r?\n/gm, "");
+  vm.runInNewContext(worklet, { Float32Array, PcmMeter, pcmMetrics,
+    AudioWorkletProcessor: class { constructor() { this.port = { postMessage: (message, transfer) => messages.push(structuredClone(message, { transfer })) }; } },
+    registerProcessor: (_, implementation) => { Processor = implementation; } });
+  const processor = new Processor();
+  const fallback = { state: "pink", classification: "Pink-like", reliable: true };
+  for (let start = 0; start < samples.length; start += 128) {
+    processor.process([[samples.subarray(start, start + 128)]]);
+    while (messages.length) {
+      const message = messages.shift();
+      assert.deepEqual(message.output, pcmMetrics(message.samples));
+      trace.record("workletOutput", message.samples);
+      capturePcm(message.samples, { rolling, recordingBuffer, sessionAccumulator, trace, fallback });
+    }
+  }
+  // Only complete 2048-sample packets have been delivered (bounded end tail).
+  const captured = rolling.latest();
+  assert.deepEqual(captured, samples.slice(0, captured.length));
+  assert.deepEqual(recordingBuffer.latest(), captured);
+  sessionAccumulator.finish(fallback);
+  const summary = sessionAccumulator.summary();
+  assert.equal(summary.percentages.silence, 0);
+  assert.equal(summary.percentages.pink, 100);
+  for (const metric of [summary.pcmDiagnostics.sessionAccumulator, summary.pcmDiagnostics.activityTimeline]) {
+    assert.equal(metric.sampleCount, captured.length);
+    assert.ok(Math.abs(metric.dbfs - pcmMetrics(captured).dbfs) < 1e-10);
+    assert.equal(metric.nonzeroRatio, 1);
+  }
+  assert.ok(Math.abs(pcmMetrics(captured).dbfs + 18) < 0.3);
+  let receive;
+  let response;
+  const worker = (await readFile(new URL("../public/noisecolor/analysis-worker.js", import.meta.url), "utf8")).replace(/^import .*;\r?\n/gm, "");
+  vm.runInNewContext(worker, { Float32Array, analyzePcm, normalizePcm, buildSpectrogram: () => null,
+    self: { addEventListener: (_, listener) => { receive = listener; }, postMessage: (value) => { response = value; } } });
+  const results = [];
+  for (const type of ["analyze-live", "analyze-recording"]) {
+    const copy = rolling.latest(128000);
+    trace.record("rollingBuffer", copy);
+    receive({ data: structuredClone({ id: 1, type, samples: copy, sampleRate: 16000, options: { ...analysisOptions, maxWelchSegments: 48, pcmDiagnostics: trace.snapshot() } }, { transfer: [copy.buffer] }) });
+    assert.equal(response.error, undefined);
+    assert.notEqual(response.result.state, "silence");
+    assert.deepEqual(response.result.pcmDiagnostics.workerInput, response.result.pcm);
+    results.push(response.result);
+  }
+  assert.equal(results[0].rawMeasuredBeta, results[1].rawMeasuredBeta);
+  assert.equal(results[0].dbfs, results[1].dbfs);
+  assert.deepEqual(rolling.latest(), captured, "worker transfer cannot detach the capture ring");
+});
+
 test("FFT agrees with an independent direct DFT and round-trips", () => {
   const input = Float64Array.from({ length: 32 }, (_, index) => Math.sin(index * 0.37) + 0.2 * Math.cos(index * 1.13));
   const expected = Array.from({ length: input.length }, (_, frequencyIndex) => {
@@ -324,9 +672,10 @@ test("seeded acoustic coloration stress matrix preserves white, pink, and brown 
   }
 });
 
-test("reported 30-second 44.1 kHz acoustic fixture changes from legacy Mixed to Moderate Pink-like", () => {
+test("reported 30-second 44.1 kHz acoustic fixture changes from legacy Mixed to Moderate Pink-like", (t) => {
   const samples = reportedAcousticFixture();
   const result = analyzeRecording(samples, 44100, { ...analysisOptions, fitRange: [100, 8000], maxWelchSegments: 96, temporalWindowSeconds: 6, temporalStepSeconds: 2 });
+  t.diagnostic(JSON.stringify({ beta: result.rawMeasuredBeta, temporalSd: result.temporalBetaSd, rmseDb: result.rmseDb, classification: result.classification, confidence: result.confidence }));
   assert.equal(legacyModelAdequacyDecision(result), true, "fixture must reproduce the v0.6.7 model-adequacy rejection");
   assert.equal(result.state, "pink", result.qualityDetail);
   assert.equal(result.classification, "Pink-like");
@@ -580,7 +929,7 @@ test("low sample-rate analysis caps the fit range below Nyquist", () => {
   assert.ok(Math.abs(result.beta - 1) <= 0.25);
 });
 
-test("scalar gain context leaves beta unchanged while frequency-response correction can change it", () => {
+test("raw measured beta never changes with calibration; corrected estimate is separate", () => {
   const samples = coloredNoise(1, { seed: 91 });
   const baseline = analyzeSamples(samples, 16000, analysisOptions);
   const scalar = analyzeSamples(samples, 16000, { ...analysisOptions, scalarGainDb: 12 });
@@ -594,7 +943,10 @@ test("scalar gain context leaves beta unchanged while frequency-response correct
     inputRouteId: "test-mic",
   });
   assert.ok(Math.abs(baseline.beta - scalar.beta) < 1e-9);
-  assert.ok(corrected.beta - baseline.beta > 0.35, `expected correction to steepen β, received ${baseline.beta} → ${corrected.beta}`);
+  assert.equal(corrected.rawMeasuredBeta, baseline.beta);
+  assert.equal(corrected.beta, baseline.beta);
+  assert.deepEqual(corrected.psd, baseline.psd);
+  assert.ok(corrected.correctedEstimate.beta - baseline.beta > 0.35);
   assert.equal(corrected.corrected, true);
   assert.equal(corrected.calibrationProfile, "Test response correction");
 
@@ -755,7 +1107,7 @@ test("pink to white to blue transitions keep stable label, beta, and confidence 
   assert.deepEqual([pendingBlue.state, pendingBlue.label, pendingBlue.displayBeta, pendingBlue.confidence], ["white", "White-like", 0, "Provisional"]);
   const blue = machine.update(measurement(-1, "blue", "Blue-like"));
   assert.deepEqual([blue.state, blue.label, blue.displayBeta, blue.confidence], ["blue", "Blue-like", -1, "High"]);
-  const noisyConfidence = machine.update({ ...measurement(-1, "blue", "Blue-like"), temporalSd: 0.4 });
+  const noisyConfidence = machine.update({ ...measurement(-1, "blue", "Blue-like"), temporalSd: 0.4, confidence: "Low" });
   assert.equal(noisyConfidence.confidence, "Low");
 });
 
@@ -889,8 +1241,8 @@ test("NoiseColor PWA paths and mobile lifecycle contracts stay scoped", async ()
 });
 
 test("exports and privacy metadata are versioned and local-first", async () => {
-  assert.match(APP_VERSION, /^\d+\.\d+\.\d+$/);
-  assert.match(ENGINE_VERSION, /^\d+\.\d+\.\d+$/);
+  assert.match(APP_VERSION, /^\d+\.\d+\.\d+(?:-[a-z]+\.\d+)?$/);
+  assert.match(ENGINE_VERSION, /^\d+\.\d+\.\d+(?:-[a-z]+\.\d+)?$/);
   const [html, readme] = await Promise.all([
     readFile(new URL("../public/noisecolor/index.html", import.meta.url), "utf8"),
     readFile(new URL("../README.md", import.meta.url), "utf8"),
