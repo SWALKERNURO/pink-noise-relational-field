@@ -3,1135 +3,228 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-  <meta name="theme-color" content="#0b1020" />
+  <meta name="theme-color" content="#070d18" />
+  <meta name="color-scheme" content="dark" />
+  <meta name="description" content="Live, private, browser-based spectral-color analysis for microphone and recorded audio." />
+  <meta name="application-name" content="NoiseColor" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-capable" content="yes" />
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
-  <meta name="description" content="Record environmental audio and estimate its 1/f spectral exponent and noise-color classification." />
-  <style>
-:root {
-  color-scheme: dark;
-  --bg: #070b16;
-  --panel: rgba(18, 26, 48, 0.78);
-  --panel-strong: #121a30;
-  --line: rgba(255, 255, 255, 0.11);
-  --text: #f7f9ff;
-  --muted: #aab4ca;
-  --accent: #7dd3fc;
-  --accent-strong: #38bdf8;
-  --good: #86efac;
-  --warn: #fde68a;
-  --danger: #fca5a5;
-  --shadow: 0 20px 60px rgba(0, 0, 0, 0.35);
-  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif;
-}
-* { box-sizing: border-box; }
-html { background: var(--bg); }
-body {
-  margin: 0;
-  min-height: 100vh;
-  background:
-    radial-gradient(circle at 20% 0%, rgba(56, 189, 248, 0.14), transparent 34rem),
-    radial-gradient(circle at 100% 10%, rgba(129, 140, 248, 0.10), transparent 30rem),
-    var(--bg);
-  color: var(--text);
-}
-button, select { font: inherit; }
-button { -webkit-tap-highlight-color: transparent; }
-.app-shell {
-  width: min(1180px, calc(100% - 28px));
-  margin: 0 auto;
-  padding: max(30px, env(safe-area-inset-top)) 0 max(42px, env(safe-area-inset-bottom));
-}
-.hero {
-  display: flex;
-  justify-content: space-between;
-  gap: 24px;
-  align-items: flex-start;
-  padding: 18px 2px 28px;
-}
-.eyebrow, .section-kicker, .metric-label {
-  margin: 0 0 7px;
-  color: var(--accent);
-  text-transform: uppercase;
-  letter-spacing: .14em;
-  font-size: .76rem;
-  font-weight: 800;
-}
-h1 { margin: 0; font-size: clamp(2.6rem, 7vw, 5.2rem); letter-spacing: -.055em; line-height: .94; }
-h2 { margin: 0; font-size: clamp(1.25rem, 3vw, 1.8rem); letter-spacing: -.025em; }
-h3 { margin: 0 0 8px; font-size: 1rem; }
-p { line-height: 1.55; }
-.lede { max-width: 760px; color: var(--muted); font-size: 1.05rem; margin: 16px 0 0; }
-.math { white-space: nowrap; color: #d9f2ff; }
-.panel, .metric-card, .caution {
-  background: var(--panel);
-  border: 1px solid var(--line);
-  border-radius: 22px;
-  box-shadow: var(--shadow);
-  backdrop-filter: blur(18px);
-  -webkit-backdrop-filter: blur(18px);
-}
-.panel { padding: clamp(18px, 3vw, 28px); margin: 18px 0; }
-.section-heading { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 20px; }
-.badge {
-  display: inline-flex;
-  align-items: center;
-  min-height: 34px;
-  padding: 7px 11px;
-  border-radius: 999px;
-  border: 1px solid var(--line);
-  color: #d8e3fa;
-  background: rgba(255,255,255,.045);
-  font-size: .78rem;
-  white-space: nowrap;
-}
-.badge-subtle { color: var(--muted); }
-.timer { font-variant-numeric: tabular-nums; font-size: 1.25rem; font-weight: 800; letter-spacing: .05em; }
-.controls-row { display: flex; flex-wrap: wrap; gap: 10px; }
-.button {
-  appearance: none;
-  border: 1px solid var(--line);
-  border-radius: 14px;
-  background: rgba(255,255,255,.06);
-  color: var(--text);
-  min-height: 46px;
-  padding: 0 16px;
-  font-weight: 750;
-  cursor: pointer;
-  transition: transform .15s ease, background .15s ease, opacity .15s ease;
-}
-.button:hover:not(:disabled) { background: rgba(255,255,255,.10); }
-.button:active:not(:disabled) { transform: translateY(1px); }
-.button:disabled { opacity: .42; cursor: not-allowed; }
-.button-primary { background: var(--accent-strong); color: #03111b; border-color: transparent; }
-.button-primary:hover:not(:disabled) { background: #67d2fb; }
-.button-quiet { background: transparent; }
-.source-divider { display: flex; align-items: center; gap: 12px; margin: 18px 0; color: #74819a; font-size: .72rem; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; }
-.source-divider::before, .source-divider::after { content: ""; height: 1px; flex: 1; background: var(--line); }
-.file-drop { position: relative; display: grid; grid-template-columns: auto 1fr; align-items: center; gap: 14px; min-height: 78px; padding: 14px; border: 1px dashed rgba(125, 211, 252, .38); border-radius: 16px; background: rgba(125, 211, 252, .035); cursor: pointer; transition: border-color .15s ease, background .15s ease; }
-.file-drop:hover, .file-drop.dragging, .file-drop:focus-within { border-color: var(--accent); background: rgba(125, 211, 252, .075); }
-.file-input { position: absolute; inline-size: 1px; block-size: 1px; opacity: 0; pointer-events: none; }
-.file-action { min-height: 42px; display: inline-flex; align-items: center; justify-content: center; padding: 0 14px; border-radius: 12px; background: rgba(255,255,255,.08); color: var(--text); font-weight: 750; }
-.file-copy { display: grid; gap: 4px; min-width: 0; }
-.file-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .9rem; }
-.file-copy small { color: var(--muted); line-height: 1.4; }
-.status { margin-top: 14px; color: var(--muted); min-height: 24px; }
-.level-wrap { display: flex; align-items: center; gap: 12px; margin-top: 12px; color: var(--muted); font-size: .82rem; }
-.level-track { flex: 1; height: 8px; background: rgba(255,255,255,.06); border-radius: 99px; overflow: hidden; }
-.level-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #60a5fa, #5eead4, #facc15); border-radius: inherit; transition: width .06s linear; }
-.metric-grid { display: grid; grid-template-columns: 1.35fr repeat(3, 1fr); gap: 14px; margin: 18px 0; }
-.metric-card { padding: 20px; min-height: 145px; }
-.metric-main { background: linear-gradient(145deg, rgba(30, 64, 175, .30), rgba(18, 26, 48, .88)); }
-.metric-value, .classification { font-size: clamp(2rem, 4vw, 3.1rem); font-weight: 850; letter-spacing: -.045em; line-height: 1; margin-top: 15px; }
-.classification { font-size: clamp(1.7rem, 4vw, 2.8rem); }
-.metric-note { color: var(--muted); font-size: .82rem; margin: 10px 0 0; }
-.range-controls { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; margin-bottom: 20px; }
-.range-controls label { display: grid; gap: 7px; color: var(--muted); font-size: .78rem; font-weight: 700; }
-select {
-  width: 100%;
-  min-height: 44px;
-  border-radius: 12px;
-  border: 1px solid var(--line);
-  background: #11192d;
-  color: var(--text);
-  padding: 0 12px;
-}
-.chart-block { margin-top: 18px; }
-.chart-header { display: flex; justify-content: space-between; gap: 14px; align-items: baseline; margin-bottom: 8px; }
-.chart-meta { color: var(--muted); font-size: .78rem; font-variant-numeric: tabular-nums; }
-canvas {
-  display: block;
-  width: 100%;
-  height: auto;
-  border-radius: 16px;
-  border: 1px solid rgba(255,255,255,.07);
-  background: rgba(4, 8, 18, .62);
-}
-.method-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
-.method-grid > div { padding: 16px; border-radius: 16px; border: 1px solid rgba(255,255,255,.07); background: rgba(255,255,255,.025); }
-.method-grid p, .small-copy { margin: 0; color: var(--muted); font-size: .9rem; }
-.export-panel { display: flex; justify-content: space-between; align-items: center; gap: 18px; }
-.caution { padding: 18px 20px; color: #d7deef; font-size: .9rem; margin: 18px 0; }
-footer { text-align: center; color: #7f8aa2; font-size: .8rem; padding-top: 8px; }
-@media (max-width: 850px) {
-  .metric-grid { grid-template-columns: 1fr 1fr; }
-  .metric-main { grid-column: 1 / -1; }
-  .method-grid { grid-template-columns: 1fr; }
-  .export-panel { align-items: flex-start; flex-direction: column; }
-}
-@media (max-width: 620px) {
-  .app-shell { width: min(100% - 18px, 1180px); }
-  .hero { flex-direction: column; }
-  .metric-grid, .range-controls { grid-template-columns: 1fr; }
-  .metric-main { grid-column: auto; }
-  .section-heading { align-items: flex-start; }
-  .controls-row .button { flex: 1 1 130px; }
-}
-
-  </style>
-  <title>NoiseColor — Spectral Color Analyzer</title>
+  <meta name="apple-mobile-web-app-title" content="NoiseColor" />
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
+  <link rel="icon" href="./icons/icon-192.png" />
+  <link rel="stylesheet" href="./styles.css?v=0.6.6" />
+  <title>NoiseColor — Live spectral structure</title>
 </head>
 <body>
-  <main class="app-shell">
-    <header class="hero">
-      <div>
-        <p class="eyebrow">Spectral Color Analyzer</p>
-        <h1>NoiseColor</h1>
-        <p class="lede">Measure the spectral exponent <strong>β</strong> in <span class="math">P(f) ∝ 1/f<sup>β</sup></span> and classify recordings as violet-, blue-, white-, pink-, or brown/red-like.</p>
+  <div class="app-shell" id="appShell" data-state="listening">
+    <header class="topbar">
+      <a class="brand" href="./" aria-label="NoiseColor home">
+        <img src="./icons/icon-192.png" alt="" width="38" height="38" />
+        <span><strong>NoiseColor</strong><small>Spectral structure analyzer</small></span>
+      </a>
+      <div class="top-actions">
+        <span id="privacyChip" class="privacy-chip">Local analysis</span>
+        <button id="clearButton" class="clear-button" type="button">Clear</button>
+        <button id="installButton" class="install-button" type="button">Install NoiseColor</button>
       </div>
-      <span id="secureBadge" class="badge">Checking microphone support…</span>
     </header>
 
-    <section class="panel control-panel" aria-labelledby="recording-title">
-      <div class="section-heading">
-        <div>
-          <p class="section-kicker">Capture</p>
-          <h2 id="recording-title">Microphone or audio file</h2>
+    <nav class="mode-nav" aria-label="NoiseColor modes">
+      <button class="mode-button active" type="button" data-view="live" aria-label="Live Analysis" aria-current="page"><span class="mode-full">Live Analysis</span><span class="mode-short">Live</span></button>
+      <button class="mode-button" type="button" data-view="record" aria-label="Record / Analyze"><span class="mode-full">Record / Analyze</span><span class="mode-short">Record</span></button>
+      <button class="mode-button" type="button" data-view="upload" aria-label="Upload Recording"><span class="mode-full">Upload Recording</span><span class="mode-short">Upload</span></button>
+      <button class="mode-button" type="button" data-view="history" aria-label="History"><span>History</span></button>
+      <button class="mode-button" type="button" data-view="advanced" aria-label="Advanced"><span>Advanced</span></button>
+    </nav>
+
+    <main class="main-grid">
+      <aside class="tool-rail" aria-label="Analysis views">
+        <img src="./icons/icon-192.png" width="34" height="34" alt="" />
+        <button type="button" data-view="live" aria-label="Live Analysis">LIVE</button>
+        <button type="button" data-view="record" aria-label="Record and analyze">REC</button>
+        <button type="button" data-view="upload" aria-label="Upload recording">FILE</button>
+        <button type="button" data-view="history" aria-label="History">LOG</button>
+        <button type="button" data-view="advanced" aria-label="Advanced scientific details">SCI</button>
+        <span id="railStatus"><i></i> LOCAL</span>
+      </aside>
+
+      <section class="workspace">
+        <div id="updateBanner" class="update-banner" hidden>
+          <span>NoiseColor update available</span>
+          <button id="reloadButton" type="button">Reload</button>
         </div>
-        <div class="timer" id="timer">00:00.0</div>
-      </div>
 
-      <div class="controls-row">
-        <button id="startBtn" class="button button-primary">Start recording</button>
-        <button id="stopBtn" class="button" disabled>Stop</button>
-        <button id="clearBtn" class="button button-quiet" disabled>Clear</button>
-      </div>
+        <section id="liveView" class="view active" data-view-panel="live" aria-labelledby="liveTitle">
+          <div class="live-heading">
+            <div>
+              <p class="eyebrow"><span class="live-dot"></span> Live microphone</p>
+              <h1 id="liveTitle">What color is the sound around you?</h1>
+              <p>One tap starts a rolling, local analysis. Audio is not saved unless you explicitly record it.</p>
+            </div>
+            <label class="mode-select">Analysis mode
+              <select id="analysisMode">
+                <option value="instant">Instant</option>
+                <option value="balanced" selected>Balanced</option>
+                <option value="stable">Stable</option>
+              </select>
+            </label>
+          </div>
 
-      <div class="source-divider"><span>or analyze a file</span></div>
+          <article class="classification-card" aria-live="polite">
+            <div class="state-orbit" aria-hidden="true"><span id="stateOrb"></span></div>
+            <div class="classification-copy">
+              <span id="liveStateLabel" class="status-label">READY</span>
+              <strong id="classification">Listening…</strong>
+              <div class="beta-row"><span id="stableBeta">Stable β —</span><small id="confidence">Start live analysis to estimate spectral color</small></div>
+              <p id="qualityDetail">The stable estimator is the primary result. The faster estimate appears below as secondary context.</p>
+            </div>
+            <button id="startLiveButton" class="primary-button" type="button">Start Live Analysis</button>
+            <button id="stopLiveButton" class="secondary-button" type="button" hidden>Stop Listening</button>
+          </article>
 
-      <label id="fileDrop" class="file-drop">
-        <input id="audioFile" class="file-input" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac" />
-        <span class="file-action">Choose audio</span>
-        <span class="file-copy"><strong id="fileName">Drop a file here</strong><small>WAV, MP3, M4A, AAC, OGG, or FLAC · up to 100 MB</small></span>
-      </label>
+          <div class="live-metrics" aria-label="Current analysis metrics">
+            <div><span>Current</span><strong id="currentColor">—</strong></div>
+            <div><span>Instant β</span><strong id="instantBeta">—</strong></div>
+            <div><span>Stability</span><strong id="stability">—</strong></div>
+            <div><span>Fit residual</span><strong id="fitResidual">—</strong></div>
+            <div><span>Signal</span><strong id="signalLevel">—</strong></div>
+            <div><span>Window</span><strong id="windowValue">8 sec</strong></div>
+          </div>
 
-      <div id="status" class="status" role="status" aria-live="polite">Ready. Record from the microphone or choose an audio file.</div>
+          <section class="chart-card beta-card">
+            <div class="card-heading"><div><span class="section-number">01</span><h2>β history</h2></div><small>Stable estimates · last 30 sec</small></div>
+            <canvas id="betaCanvas" width="900" height="300" role="img" aria-label="Spectral exponent beta history over the last 30 seconds" aria-describedby="betaDataSummary"></canvas>
+            <p id="betaDataSummary" class="chart-data-summary">No β history is available.</p>
+          </section>
 
-      <div class="level-wrap" aria-label="Microphone input level">
-        <div class="level-track"><div id="levelBar" class="level-bar"></div></div>
-        <span id="levelText">Input —</span>
-      </div>
-    </section>
+          <div id="liveSummary" class="session-summary" hidden>
+            <div class="card-heading"><div><span class="section-number">SESSION</span><h2>Live summary</h2></div><button id="saveSummaryButton" type="button">Save to History</button></div>
+            <div id="summaryMetrics" class="summary-grid"></div>
+            <div id="summaryTimeline" class="summary-timeline" role="img" aria-label="Color and quality state timeline for this live session"></div>
+            <div class="summary-actions"><button id="exportSummaryButton" type="button">Export JSON</button><button id="exportSummaryCsvButton" type="button">Export CSV</button></div>
+          </div>
+        </section>
 
-    <section class="metric-grid" aria-label="Analysis summary">
-      <article class="metric-card metric-main">
-        <p class="metric-label">Classification</p>
-        <div id="classification" class="classification">—</div>
-        <p id="classificationNote" class="metric-note">Record at least 3 seconds of relatively stationary sound.</p>
-      </article>
-      <article class="metric-card">
-        <p class="metric-label">Spectral exponent β</p>
-        <div id="betaValue" class="metric-value">—</div>
-        <p class="metric-note">Canonical pink noise: β ≈ 1</p>
-      </article>
-      <article class="metric-card">
-        <p class="metric-label">Fit residual</p>
-        <div id="r2Value" class="metric-value">—</div>
-        <p id="fitNote" class="metric-note">Residual error in dB; R² is also reported.</p>
-      </article>
-      <article class="metric-card">
-        <p class="metric-label">Confidence</p>
-        <div id="confidenceValue" class="metric-value">—</div>
-        <p id="confidenceNote" class="metric-note">Depends on fit quality and distance from a canonical color slope.</p>
-      </article>
-    </section>
+        <section id="recordView" class="view" data-view-panel="record" aria-labelledby="recordTitle" hidden>
+          <p class="eyebrow">Opt-in audio capture</p>
+          <h1 id="recordTitle">Record, then analyze</h1>
+          <p class="view-lede">Recording is separate from Live Analysis. Raw audio exists only when you choose this mode and can be downloaded after you stop.</p>
+          <div class="action-panel">
+            <div><span id="recordTimer">00:00</span><small id="recordFormat">Format selected after browser detection</small></div>
+            <button id="recordButton" class="primary-button" type="button">Start Recording</button>
+            <button id="stopRecordButton" class="secondary-button" type="button" hidden>Stop & Analyze</button>
+            <button id="downloadAudioButton" class="secondary-button" type="button" hidden>Download Audio</button>
+          </div>
+          <div id="recordStatus" class="inline-status" role="status">No audio is being recorded.</div>
+          <div id="recordResult" class="result-panel" hidden></div>
+        </section>
 
-    <section class="panel" aria-labelledby="analysis-title">
-      <div class="section-heading">
-        <div>
-          <p class="section-kicker">Analysis</p>
-          <h2 id="analysis-title">Power spectral density</h2>
-        </div>
-        <span id="sampleRateLabel" class="badge badge-subtle">Sample rate —</span>
-      </div>
+        <section id="uploadView" class="view" data-view-panel="upload" aria-labelledby="uploadTitle" hidden>
+          <p class="eyebrow">Local file analysis</p>
+          <h1 id="uploadTitle">Upload a recording</h1>
+          <p class="view-lede">Choose an audio file supported by your browser. It is decoded and analyzed on this device, never uploaded.</p>
+          <label id="fileDrop" class="file-drop">
+            <input id="audioFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac" />
+            <strong>Choose or drop audio</strong>
+            <span id="fileName">PCM WAV up to 40 MB · verified compressed audio up to 12 MB / 2 min</span>
+          </label>
+          <div id="uploadStatus" class="inline-status" role="status">Ready for a local audio file.</div>
+          <div id="uploadResult" class="result-panel" hidden></div>
+        </section>
 
-      <div class="range-controls">
-        <label>
-          Fit from
-          <select id="minFreq">
-            <option value="50">50 Hz</option>
-            <option value="80">80 Hz</option>
-            <option value="100" selected>100 Hz</option>
-            <option value="200">200 Hz</option>
-            <option value="500">500 Hz</option>
-          </select>
-        </label>
-        <label>
-          to
-          <select id="maxFreq">
-            <option value="4000">4 kHz</option>
-            <option value="8000" selected>8 kHz</option>
-            <option value="12000">12 kHz</option>
-            <option value="16000">16 kHz</option>
-          </select>
-        </label>
-        <label>
-          Analysis window
-          <select id="windowSeconds">
-            <option value="5">Last 5 s</option>
-            <option value="10" selected>Last 10 s</option>
-            <option value="20">Last 20 s</option>
-            <option value="60">Last 60 s</option>
-            <option value="0">Full recording</option>
-          </select>
-        </label>
-      </div>
+        <section id="historyView" class="view" data-view-panel="history" aria-labelledby="historyTitle" hidden>
+          <div class="view-heading-row">
+            <div><p class="eyebrow">On this device only</p><h1 id="historyTitle">Previous results</h1></div>
+            <button id="clearHistoryButton" class="danger-button" type="button">Delete all</button>
+          </div>
+          <p class="view-lede">History stores measurement results and metadata in this browser. Raw audio is not included.</p>
+          <div id="historyList" class="history-list"><p class="empty-state">No saved measurements yet.</p></div>
+          <nav class="history-pagination" aria-label="Saved measurement pages">
+            <button id="historyPrevious" type="button" disabled>Previous</button>
+            <span id="historyPageStatus" role="status" aria-live="polite">Page 1</span>
+            <button id="historyNext" type="button" disabled>Next</button>
+          </nav>
+        </section>
 
-      <div class="chart-block">
-        <div class="chart-header">
-          <h3>Log-log PSD + fitted slope</h3>
-          <span id="fitEquation" class="chart-meta">—</span>
-        </div>
-        <canvas id="spectrumCanvas" width="1200" height="560" aria-label="Power spectral density chart"></canvas>
-      </div>
+        <section id="advancedView" class="view" data-view-panel="advanced" aria-labelledby="advancedTitle" hidden>
+          <p class="eyebrow">Scientific details</p>
+          <h1 id="advancedTitle">See why the label fits—or does not</h1>
+          <p class="view-lede">β always comes from the unweighted continuous Welch PSD. Third-octave bands are contextual and never drive noise-color classification.</p>
+          <div class="advanced-tabs" role="tablist" aria-label="Scientific analysis views">
+            <button id="tabSpectrum" class="advanced-tab active" type="button" data-advanced="spectrum" role="tab" aria-selected="true" aria-controls="panelSpectrum" tabindex="0">Spectrum</button>
+            <button id="tabSpectrogram" class="advanced-tab" type="button" data-advanced="spectrogram" role="tab" aria-selected="false" aria-controls="panelSpectrogram" tabindex="-1">Spectrogram</button>
+            <button id="tabDiagnostics" class="advanced-tab" type="button" data-advanced="diagnostics" role="tab" aria-selected="false" aria-controls="panelDiagnostics" tabindex="-1">Diagnostics</button>
+            <button id="tabCalibration" class="advanced-tab" type="button" data-advanced="calibration" role="tab" aria-selected="false" aria-controls="panelCalibration" tabindex="-1">Calibration</button>
+          </div>
+          <div id="panelSpectrum" class="advanced-panel active" data-advanced-panel="spectrum" role="tabpanel" aria-labelledby="tabSpectrum">
+            <div class="spectrum-toggle"><button class="active" type="button" data-spectrum="psd">Continuous PSD</button><button type="button" data-spectrum="third">1/3-octave context</button></div>
+            <canvas id="spectrumCanvas" width="980" height="430" role="img" aria-label="Continuous Welch power spectral density and fitted power-law slope" aria-describedby="spectrumDataSummary spectrumNote"></canvas>
+            <p id="spectrumDataSummary" class="chart-data-summary">No spectrum data is available.</p>
+            <p id="spectrumNote" class="chart-note">Start Live Analysis or analyze a recording to populate the spectrum.</p>
+          </div>
+          <div id="panelSpectrogram" class="advanced-panel" data-advanced-panel="spectrogram" role="tabpanel" aria-labelledby="tabSpectrogram" hidden>
+            <canvas id="spectrogramCanvas" width="980" height="430" role="img" aria-label="Time-frequency spectrogram" aria-describedby="spectrogramDataSummary"></canvas>
+            <p id="spectrogramDataSummary" class="chart-data-summary">No spectrogram data is available.</p>
+            <p class="chart-note">The spectrogram reveals tones, harmonics, and time-varying structure that one β cannot summarize.</p>
+          </div>
+          <div id="panelDiagnostics" class="advanced-panel" data-advanced-panel="diagnostics" role="tabpanel" aria-labelledby="tabDiagnostics" hidden>
+            <div id="diagnosticGrid" class="diagnostic-grid"></div>
+            <div class="measured-interpretation">
+              <div><span>MEASURED</span><p id="measuredCopy">No measurement yet.</p></div>
+              <div><span>INTERPRETATION</span><p id="interpretationCopy">Noise color is only reported when input and model-quality gates pass.</p></div>
+              <div><span>OPEN QUESTION</span><p>Does one stationary power law adequately describe this sound source over the selected range?</p></div>
+            </div>
+          </div>
+          <div id="panelCalibration" class="advanced-panel" data-advanced-panel="calibration" role="tabpanel" aria-labelledby="tabCalibration" hidden>
+            <div class="calibration-grid">
+              <div class="calibration-copy">
+                <h2>Frequency-response correction</h2>
+                <p>Scalar gain shifts the spectrum vertically and does not materially change β. A frequency-dependent microphone response can change β, so correction profiles are optional, named, and input-route specific.</p>
+                <strong id="calibrationState" role="status" aria-live="polite" aria-atomic="true">Uncorrected</strong>
+              </div>
+              <label class="file-drop compact">
+                <input id="calibrationFile" type="file" accept="application/json,.json" />
+                <strong>Import calibration JSON</strong>
+                <span>{ name, routeId, points: [{ frequency, correctionDb }] }</span>
+              </label>
+              <label>Active profile
+                <select id="calibrationProfile"><option value="">None · uncorrected</option></select>
+              </label>
+              <label>Scalar gain / SPL context (dB)
+                <input id="scalarGain" type="number" step="0.1" value="0" />
+                <small>Recorded for context only; never used to calculate β.</small>
+              </label>
+            </div>
+          </div>
+        </section>
+      </section>
 
-      <div class="chart-block">
-        <div class="chart-header">
-          <h3>Waveform</h3>
-          <span class="chart-meta">Recent audio</span>
-        </div>
-        <canvas id="waveCanvas" width="1200" height="260" aria-label="Audio waveform chart"></canvas>
-      </div>
-    </section>
+      <aside class="interpretation-rail">
+        <section><span class="rail-number">01</span><h2>Measured</h2><div id="railMeasured">No live measurement yet.</div></section>
+        <section><span class="rail-number">02</span><h2>Interpretation</h2><p id="railInterpretation">A canonical color appears only after the stable estimator passes silence, clipping, tonal, stability, and fit-quality gates.</p></section>
+        <section><span class="rail-number dim">03</span><h2>Question</h2><p>Is the current sound genuinely broadband and scale-like, or is one β hiding tones and change over time?</p></section>
+        <footer><strong>PRIVATE BY DESIGN</strong><p>Audio is analyzed locally and is not uploaded to a server.</p><small id="versionLabel">NoiseColor v0.6.6</small></footer>
+      </aside>
+    </main>
 
-    <section class="panel" aria-labelledby="method-title">
-      <div class="section-heading">
-        <div>
-          <p class="section-kicker">Method</p>
-          <h2 id="method-title">What the app is measuring</h2>
-        </div>
-      </div>
-      <div class="method-grid">
-        <div>
-          <h3>Welch PSD</h3>
-          <p>Audio is divided into overlapping Hann-windowed segments. Their one-sided power spectra are averaged to reduce variance.</p>
-        </div>
-        <div>
-          <h3>Power-law fit</h3>
-          <p>The app regresses log<sub>10</sub>(power) on log<sub>10</sub>(frequency). The reported spectral exponent is β = −slope. Fit residual is evaluated in dB.</p>
-        </div>
-        <div>
-          <h3>Conservative label</h3>
-          <p>A color label is only treated as reliable when the spectrum is reasonably described by one power-law slope over the selected range.</p>
-        </div>
-      </div>
-    </section>
-
-    <section class="panel export-panel" aria-labelledby="export-title">
-      <div>
-        <p class="section-kicker">Export</p>
-        <h2 id="export-title">Save the measurement</h2>
-        <p class="small-copy">JSON contains the summary and PSD data. CSV contains frequency/power rows plus the fitted spectrum.</p>
-      </div>
-      <div class="controls-row">
-        <button id="jsonBtn" class="button" disabled>Export JSON</button>
-        <button id="csvBtn" class="button" disabled>Export CSV</button>
-      </div>
-    </section>
-
-    <aside class="caution">
-      <strong>Measurement note:</strong> the built-in iPhone microphone and iOS audio processing are not a calibrated acoustic measurement chain. This is suitable for exploratory/relative spectral analysis. For rigorous acoustic work, use a calibrated external microphone and known frequency-response correction.
-    </aside>
-
-    <footer>
-      <p>NoiseColor estimates spectral shape, not perceived loudness or sound-pressure level.</p>
+    <footer class="mobile-footer">
+      <strong>Private by design.</strong> Audio is analyzed locally and is not uploaded to a server. NoiseColor estimates spectral structure, not calibrated sound-pressure level.
     </footer>
-  </main>
-
-  <script>
-(() => {
-  'use strict';
-
-  const MAX_CAPTURE_SECONDS = 120;
-  const MAX_FILE_BYTES = 100 * 1024 * 1024;
-  const MIN_ANALYSIS_SECONDS = 3;
-  const WELCH_SIZE = 4096;
-  const WELCH_OVERLAP = 0.5;
-
-  const els = {
-    startBtn: document.getElementById('startBtn'),
-    stopBtn: document.getElementById('stopBtn'),
-    clearBtn: document.getElementById('clearBtn'),
-    audioFile: document.getElementById('audioFile'),
-    fileDrop: document.getElementById('fileDrop'),
-    fileName: document.getElementById('fileName'),
-    jsonBtn: document.getElementById('jsonBtn'),
-    csvBtn: document.getElementById('csvBtn'),
-    status: document.getElementById('status'),
-    timer: document.getElementById('timer'),
-    secureBadge: document.getElementById('secureBadge'),
-    sampleRateLabel: document.getElementById('sampleRateLabel'),
-    classification: document.getElementById('classification'),
-    classificationNote: document.getElementById('classificationNote'),
-    betaValue: document.getElementById('betaValue'),
-    r2Value: document.getElementById('r2Value'),
-    fitNote: document.getElementById('fitNote'),
-    confidenceValue: document.getElementById('confidenceValue'),
-    confidenceNote: document.getElementById('confidenceNote'),
-    fitEquation: document.getElementById('fitEquation'),
-    minFreq: document.getElementById('minFreq'),
-    maxFreq: document.getElementById('maxFreq'),
-    windowSeconds: document.getElementById('windowSeconds'),
-    spectrumCanvas: document.getElementById('spectrumCanvas'),
-    waveCanvas: document.getElementById('waveCanvas'),
-    levelBar: document.getElementById('levelBar'),
-    levelText: document.getElementById('levelText')
-  };
-
-  const state = {
-    stream: null,
-    audioContext: null,
-    source: null,
-    analyser: null,
-    captureNode: null,
-    captureSink: null,
-    chunks: [],
-    totalSamples: 0,
-    sampleRate: null,
-    recording: false,
-    startedAt: null,
-    sourceType: null,
-    sourceName: null,
-    raf: null,
-    timerId: null,
-    analysisTimer: null,
-    result: null
-  };
-
-  function setStatus(text, tone = 'neutral') {
-    els.status.textContent = text;
-    els.status.style.color = tone === 'error' ? 'var(--danger)' : tone === 'good' ? 'var(--good)' : tone === 'warn' ? 'var(--warn)' : 'var(--muted)';
-  }
-
-  function formatDuration(seconds) {
-    const mins = Math.floor(seconds / 60).toString().padStart(2, '0');
-    const secs = Math.floor(seconds % 60).toString().padStart(2, '0');
-    const tenths = Math.floor((seconds % 1) * 10);
-    return `${mins}:${secs}.${tenths}`;
-  }
-
-  function updateTimer() {
-    if (!state.recording || !state.startedAt) return;
-    els.timer.textContent = formatDuration((performance.now() - state.startedAt) / 1000);
-  }
-
-  function supportsMicrophone() {
-    return Boolean(navigator.mediaDevices?.getUserMedia && (window.AudioContext || window.webkitAudioContext));
-  }
-
-  function updateEnvironmentBadge() {
-    if (!supportsMicrophone()) {
-      els.secureBadge.textContent = 'Microphone API unavailable';
-      return;
-    }
-    if (!window.isSecureContext && location.hostname !== 'localhost') {
-      els.secureBadge.textContent = 'HTTPS required for microphone';
-      setStatus('This page must be served over HTTPS (or localhost) for iPhone/Safari microphone access.', 'warn');
-      return;
-    }
-    els.secureBadge.textContent = 'Microphone-ready';
-  }
-
-  async function startRecording() {
-    if (!supportsMicrophone()) {
-      setStatus('This browser does not expose the required Web Audio microphone APIs.', 'error');
-      return;
-    }
-    if (!window.isSecureContext && location.hostname !== 'localhost') {
-      setStatus('Microphone access requires HTTPS or localhost. Opening the HTML file directly will not work on iPhone.', 'error');
-      return;
-    }
-
-    try {
-      resetMeasurement(false);
-      setStatus('Requesting microphone permission…');
-      state.stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-          channelCount: 1
-        },
-        video: false
-      });
-
-      const AudioCtx = window.AudioContext || window.webkitAudioContext;
-      state.audioContext = new AudioCtx({ latencyHint: 'interactive' });
-      if (state.audioContext.state === 'suspended') await state.audioContext.resume();
-
-      state.sampleRate = state.audioContext.sampleRate;
-      state.sourceType = 'microphone';
-      state.sourceName = null;
-      state.source = state.audioContext.createMediaStreamSource(state.stream);
-      state.analyser = state.audioContext.createAnalyser();
-      state.analyser.fftSize = 2048;
-      state.analyser.smoothingTimeConstant = 0.2;
-      state.source.connect(state.analyser);
-
-      await attachCaptureNode();
-
-      state.recording = true;
-      state.startedAt = performance.now();
-      els.startBtn.disabled = true;
-      els.stopBtn.disabled = false;
-      els.clearBtn.disabled = false;
-      els.sampleRateLabel.textContent = `Sample rate ${Math.round(state.sampleRate / 100) / 10} kHz`;
-      setStatus('Recording. Keep the source reasonably steady for the cleanest spectral estimate.', 'good');
-
-      state.timerId = setInterval(updateTimer, 100);
-      state.analysisTimer = setInterval(() => {
-        if (state.totalSamples >= state.sampleRate * MIN_ANALYSIS_SECONDS) runAnalysis();
-      }, 1000);
-      drawLive();
-    } catch (err) {
-      console.error(err);
-      stopMediaTracks();
-      const message = err?.name === 'NotAllowedError'
-        ? 'Microphone permission was denied. Enable microphone access for this site in Safari settings and try again.'
-        : `Could not start the microphone: ${err?.message || err}`;
-      setStatus(message, 'error');
-      els.startBtn.disabled = false;
-      els.stopBtn.disabled = true;
-    }
-  }
-
-  async function loadAudioFile(file) {
-    if (!file) return;
-    const AudioCtx = window.AudioContext || window.webkitAudioContext;
-    if (!AudioCtx) {
-      setStatus('This browser cannot decode audio files with the Web Audio API.', 'error');
-      return;
-    }
-    if (file.size > MAX_FILE_BYTES) {
-      setStatus('Choose an audio file smaller than 100 MB.', 'error');
-      return;
-    }
-
-    els.startBtn.disabled = true;
-    els.audioFile.disabled = true;
-    els.fileName.textContent = file.name;
-    setStatus(`Decoding ${file.name}…`);
-
-    try {
-      resetMeasurement(false);
-      stopMediaTracks();
-      const context = new AudioCtx();
-      const encoded = await file.arrayBuffer();
-      const decoded = await context.decodeAudioData(encoded.slice(0));
-      const retainedSamples = Math.min(decoded.length, Math.floor(decoded.sampleRate * MAX_CAPTURE_SECONDS));
-      const sourceStart = decoded.length - retainedSamples;
-      const mono = new Float32Array(retainedSamples);
-
-      for (let channel = 0; channel < decoded.numberOfChannels; channel++) {
-        const channelData = decoded.getChannelData(channel);
-        for (let index = 0; index < retainedSamples; index++) {
-          mono[index] += channelData[sourceStart + index] / decoded.numberOfChannels;
-        }
-      }
-
-      await context.close();
-      state.chunks = [mono];
-      state.totalSamples = mono.length;
-      state.sampleRate = decoded.sampleRate;
-      state.sourceType = 'file';
-      state.sourceName = file.name;
-      state.startedAt = null;
-
-      const retainedSeconds = mono.length / decoded.sampleRate;
-      const truncated = decoded.duration > retainedSeconds + 0.01;
-      els.timer.textContent = formatDuration(retainedSeconds);
-      els.sampleRateLabel.textContent = `Sample rate ${Math.round(state.sampleRate / 100) / 10} kHz`;
-      els.clearBtn.disabled = false;
-      els.levelBar.style.width = '0%';
-      els.levelText.textContent = `File · ${decoded.numberOfChannels} channel${decoded.numberOfChannels === 1 ? '' : 's'}`;
-
-      if (retainedSeconds < MIN_ANALYSIS_SECONDS) {
-        setStatus(`The decoded file is ${retainedSeconds.toFixed(1)} s; at least ${MIN_ANALYSIS_SECONDS} s is required.`, 'warn');
-        return;
-      }
-
-      runAnalysis();
-      setStatus(
-        truncated
-          ? `Analyzed the final ${MAX_CAPTURE_SECONDS} seconds of ${file.name}. Adjust the fit range or analysis window to explore the result.`
-          : `Analyzed ${file.name}. Adjust the fit range or analysis window to explore the result.`,
-        'good'
-      );
-    } catch (err) {
-      console.error(err);
-      resetMeasurement(false);
-      els.fileName.textContent = 'Drop a file here';
-      setStatus(`Could not decode ${file.name}. Try WAV, MP3, M4A, AAC, OGG, or FLAC supported by this browser.`, 'error');
-    } finally {
-      els.startBtn.disabled = false;
-      els.audioFile.disabled = false;
-      els.audioFile.value = '';
-    }
-  }
-
-  async function attachCaptureNode() {
-    const ctx = state.audioContext;
-    const sink = ctx.createGain();
-    sink.gain.value = 0;
-    sink.connect(ctx.destination);
-    state.captureSink = sink;
-
-    if (ctx.audioWorklet?.addModule) {
-      const workletCode = `
-        class PCMCollector extends AudioWorkletProcessor {
-          process(inputs) {
-            const input = inputs[0];
-            if (input && input[0]) {
-              const copy = new Float32Array(input[0]);
-              this.port.postMessage(copy, [copy.buffer]);
-            }
-            return true;
-          }
-        }
-        registerProcessor('pcm-collector', PCMCollector);
-      `;
-      const blob = new Blob([workletCode], { type: 'application/javascript' });
-      const url = URL.createObjectURL(blob);
-      try {
-        await ctx.audioWorklet.addModule(url);
-        state.captureNode = new AudioWorkletNode(ctx, 'pcm-collector', {
-          numberOfInputs: 1,
-          numberOfOutputs: 1,
-          outputChannelCount: [1]
-        });
-        state.captureNode.port.onmessage = (event) => appendSamples(new Float32Array(event.data));
-        state.source.connect(state.captureNode);
-        state.captureNode.connect(sink);
-        return;
-      } finally {
-        URL.revokeObjectURL(url);
-      }
-    }
-
-    // Compatibility fallback for older Safari versions.
-    const processor = ctx.createScriptProcessor(4096, 1, 1);
-    processor.onaudioprocess = (event) => appendSamples(new Float32Array(event.inputBuffer.getChannelData(0)));
-    state.captureNode = processor;
-    state.source.connect(processor);
-    processor.connect(sink);
-  }
-
-  function appendSamples(chunk) {
-    if (!state.recording && state.startedAt !== null) return;
-    state.chunks.push(chunk);
-    state.totalSamples += chunk.length;
-
-    const maxSamples = Math.floor((state.sampleRate || 48000) * MAX_CAPTURE_SECONDS);
-    while (state.totalSamples > maxSamples && state.chunks.length > 1) {
-      const removed = state.chunks.shift();
-      state.totalSamples -= removed.length;
-    }
-  }
-
-  function stopRecording() {
-    if (!state.recording) return;
-    state.recording = false;
-    clearInterval(state.timerId);
-    clearInterval(state.analysisTimer);
-    state.timerId = null;
-    state.analysisTimer = null;
-    updateTimer();
-    els.startBtn.disabled = false;
-    els.stopBtn.disabled = true;
-    stopMediaTracks();
-    if (state.totalSamples >= (state.sampleRate || 1) * MIN_ANALYSIS_SECONDS) {
-      runAnalysis();
-      setStatus('Recording stopped. Adjust the fit range if you want to test the slope over a different band.', 'good');
-    } else {
-      setStatus(`Record at least ${MIN_ANALYSIS_SECONDS} seconds for analysis.`, 'warn');
-    }
-  }
-
-  function stopMediaTracks() {
-    try { state.stream?.getTracks().forEach(t => t.stop()); } catch (_) {}
-    try { state.captureNode?.disconnect(); } catch (_) {}
-    try { state.captureSink?.disconnect(); } catch (_) {}
-    try { state.source?.disconnect(); } catch (_) {}
-    try { state.analyser?.disconnect(); } catch (_) {}
-    try { state.audioContext?.close(); } catch (_) {}
-    state.stream = null;
-    state.captureNode = null;
-    state.captureSink = null;
-    state.source = null;
-    state.analyser = null;
-    state.audioContext = null;
-    if (state.raf) cancelAnimationFrame(state.raf);
-    state.raf = null;
-    els.levelBar.style.width = '0%';
-    els.levelText.textContent = 'Input —';
-  }
-
-  function resetMeasurement(full = true) {
-    if (state.recording) stopRecording();
-    state.chunks = [];
-    state.totalSamples = 0;
-    state.result = null;
-    state.startedAt = null;
-    state.sourceType = null;
-    state.sourceName = null;
-    els.timer.textContent = '00:00.0';
-    els.classification.textContent = '—';
-    els.classificationNote.textContent = 'Record at least 3 seconds of relatively stationary sound.';
-    els.betaValue.textContent = '—';
-    els.r2Value.textContent = '—';
-    els.confidenceValue.textContent = '—';
-    els.fitEquation.textContent = '—';
-    els.jsonBtn.disabled = true;
-    els.csvBtn.disabled = true;
-    if (full) {
-      els.sampleRateLabel.textContent = 'Sample rate —';
-      els.fileName.textContent = 'Drop a file here';
-      els.levelText.textContent = 'Input —';
-      setStatus('Ready. Record from the microphone or choose an audio file.');
-    }
-    clearCanvas(els.spectrumCanvas, 'Record audio to see the power spectrum');
-    clearCanvas(els.waveCanvas, 'Waveform');
-  }
-
-  function flattenChunks(maxSeconds = 0) {
-    if (!state.sampleRate || state.totalSamples === 0) return new Float32Array(0);
-    const wanted = maxSeconds > 0 ? Math.min(state.totalSamples, Math.floor(state.sampleRate * maxSeconds)) : state.totalSamples;
-    const out = new Float32Array(wanted);
-    let write = wanted;
-    for (let i = state.chunks.length - 1; i >= 0 && write > 0; i--) {
-      const chunk = state.chunks[i];
-      const take = Math.min(chunk.length, write);
-      write -= take;
-      out.set(chunk.subarray(chunk.length - take), write);
-    }
-    return out;
-  }
-
-  function runAnalysis() {
-    if (!state.sampleRate) return;
-    const selectedWindow = Number(els.windowSeconds.value);
-    const samples = flattenChunks(selectedWindow);
-    if (samples.length < state.sampleRate * MIN_ANALYSIS_SECONDS) return;
-
-    const psd = welchPSD(samples, state.sampleRate, WELCH_SIZE, WELCH_OVERLAP);
-    const minFreq = Number(els.minFreq.value);
-    const requestedMax = Number(els.maxFreq.value);
-    const maxFreq = Math.min(requestedMax, state.sampleRate * 0.48);
-    const fit = fitPowerLaw(psd.freqs, psd.power, minFreq, maxFreq);
-    const interpretation = interpretSlope(fit.beta, fit.r2, fit.rmseDb);
-
-    state.result = {
-      timestamp: new Date().toISOString(),
-      sourceType: state.sourceType,
-      sourceName: state.sourceName,
-      durationSeconds: samples.length / state.sampleRate,
-      sampleRateHz: state.sampleRate,
-      fitRangeHz: [minFreq, maxFreq],
-      welchSegmentSize: WELCH_SIZE,
-      welchOverlap: WELCH_OVERLAP,
-      beta: fit.beta,
-      slope: fit.slope,
-      intercept: fit.intercept,
-      r2: fit.r2,
-      rmseDb: fit.rmseDb,
-      maeDb: fit.maeDb,
-      pointsUsed: fit.pointsUsed,
-      classification: interpretation.label,
-      canonicalBeta: interpretation.canonicalBeta,
-      confidence: interpretation.confidence,
-      reliableSinglePowerLaw: interpretation.reliable,
-      frequenciesHz: Array.from(psd.freqs),
-      power: Array.from(psd.power)
-    };
-
-    renderResult(state.result, psd, fit, interpretation);
-    els.jsonBtn.disabled = false;
-    els.csvBtn.disabled = false;
-  }
-
-  function welchPSD(samples, sampleRate, segmentSize, overlapFraction) {
-    const n = Math.min(segmentSize, highestPowerOfTwo(samples.length));
-    if (n < 256) throw new Error('Not enough samples for spectral analysis.');
-    const hop = Math.max(1, Math.floor(n * (1 - overlapFraction)));
-    const bins = n / 2 + 1;
-    const acc = new Float64Array(bins);
-    const window = new Float64Array(n);
-    let windowPower = 0;
-    for (let i = 0; i < n; i++) {
-      const w = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (n - 1));
-      window[i] = w;
-      windowPower += w * w;
-    }
-
-    let segments = 0;
-    for (let start = 0; start + n <= samples.length; start += hop) {
-      const re = new Float64Array(n);
-      const im = new Float64Array(n);
-      let mean = 0;
-      for (let i = 0; i < n; i++) mean += samples[start + i];
-      mean /= n;
-      for (let i = 0; i < n; i++) re[i] = (samples[start + i] - mean) * window[i];
-      fftInPlace(re, im);
-      for (let k = 0; k < bins; k++) {
-        let p = (re[k] * re[k] + im[k] * im[k]) / (sampleRate * windowPower);
-        if (k > 0 && k < n / 2) p *= 2;
-        acc[k] += p;
-      }
-      segments++;
-    }
-
-    if (segments === 0) {
-      const padded = new Float32Array(n);
-      padded.set(samples.subarray(Math.max(0, samples.length - n)));
-      return welchPSD(padded, sampleRate, n, 0);
-    }
-
-    const freqs = new Float64Array(bins);
-    const power = new Float64Array(bins);
-    for (let k = 0; k < bins; k++) {
-      freqs[k] = (k * sampleRate) / n;
-      power[k] = Math.max(acc[k] / segments, Number.MIN_VALUE);
-    }
-    return { freqs, power, segments, segmentSize: n };
-  }
-
-  function highestPowerOfTwo(n) {
-    return 2 ** Math.floor(Math.log2(Math.max(1, n)));
-  }
-
-  function fftInPlace(re, im) {
-    const n = re.length;
-    let j = 0;
-    for (let i = 1; i < n; i++) {
-      let bit = n >> 1;
-      for (; j & bit; bit >>= 1) j ^= bit;
-      j ^= bit;
-      if (i < j) {
-        [re[i], re[j]] = [re[j], re[i]];
-        [im[i], im[j]] = [im[j], im[i]];
-      }
-    }
-    for (let len = 2; len <= n; len <<= 1) {
-      const angle = -2 * Math.PI / len;
-      const wLenCos = Math.cos(angle);
-      const wLenSin = Math.sin(angle);
-      for (let i = 0; i < n; i += len) {
-        let wCos = 1, wSin = 0;
-        for (let k = 0; k < len / 2; k++) {
-          const uRe = re[i + k], uIm = im[i + k];
-          const vRe0 = re[i + k + len / 2], vIm0 = im[i + k + len / 2];
-          const vRe = vRe0 * wCos - vIm0 * wSin;
-          const vIm = vRe0 * wSin + vIm0 * wCos;
-          re[i + k] = uRe + vRe;
-          im[i + k] = uIm + vIm;
-          re[i + k + len / 2] = uRe - vRe;
-          im[i + k + len / 2] = uIm - vIm;
-          const nextCos = wCos * wLenCos - wSin * wLenSin;
-          wSin = wCos * wLenSin + wSin * wLenCos;
-          wCos = nextCos;
-        }
-      }
-    }
-  }
-
-  function fitPowerLaw(freqs, power, minFreq, maxFreq) {
-    const xs = [];
-    const ys = [];
-    for (let i = 1; i < freqs.length; i++) {
-      const f = freqs[i];
-      const p = power[i];
-      if (f >= minFreq && f <= maxFreq && p > 0 && Number.isFinite(p)) {
-        xs.push(Math.log10(f));
-        ys.push(Math.log10(p));
-      }
-    }
-    if (xs.length < 8) return { beta: NaN, slope: NaN, intercept: NaN, r2: 0, rmseDb: Infinity, maeDb: Infinity, pointsUsed: xs.length };
-
-    const n = xs.length;
-    const meanX = xs.reduce((a,b) => a + b, 0) / n;
-    const meanY = ys.reduce((a,b) => a + b, 0) / n;
-    let sxx = 0, sxy = 0, sst = 0;
-    for (let i = 0; i < n; i++) {
-      const dx = xs[i] - meanX;
-      const dy = ys[i] - meanY;
-      sxx += dx * dx;
-      sxy += dx * dy;
-      sst += dy * dy;
-    }
-    const slope = sxy / sxx;
-    const intercept = meanY - slope * meanX;
-    let sse = 0, absErrorDb = 0;
-    for (let i = 0; i < n; i++) {
-      const resid = ys[i] - (intercept + slope * xs[i]);
-      sse += resid * resid;
-      absErrorDb += Math.abs(10 * resid);
-    }
-    const r2 = sst > 0 ? Math.max(0, Math.min(1, 1 - sse / sst)) : 0;
-    const rmseDb = 10 * Math.sqrt(sse / n);
-    const maeDb = absErrorDb / n;
-    return { beta: -slope, slope, intercept, r2, rmseDb, maeDb, pointsUsed: n };
-  }
-
-  function interpretSlope(beta, r2, rmseDb) {
-    if (!Number.isFinite(beta) || !Number.isFinite(rmseDb)) return { label: 'Unclassified', canonicalBeta: null, confidence: 'None', reliable: false };
-    const colors = [
-      { name: 'Violet-like', beta: -2 },
-      { name: 'Blue-like', beta: -1 },
-      { name: 'White-like', beta: 0 },
-      { name: 'Pink-like', beta: 1 },
-      { name: 'Brown/red-like', beta: 2 }
-    ];
-    let nearest = colors[0];
-    for (const c of colors) if (Math.abs(beta - c.beta) < Math.abs(beta - nearest.beta)) nearest = c;
-    const distance = Math.abs(beta - nearest.beta);
-
-    // R² is useful for sloped spectra, but is intrinsically near zero for an ideal flat
-    // (white) spectrum because a zero-slope model explains essentially none of the random
-    // bin-to-bin variance. Residual error in dB is therefore the primary model adequacy test.
-    const reliable = rmseDb <= 3.5 && beta >= -2.75 && beta <= 2.75;
-
-    let confidence = 'Low';
-    if (!reliable) confidence = 'None';
-    else if (rmseDb <= 1.5 && distance <= 0.25) confidence = 'High';
-    else if (rmseDb <= 2.5 && distance <= 0.50) confidence = 'Moderate';
-
-    return {
-      label: reliable ? nearest.name : 'No reliable color',
-      nearestLabel: nearest.name,
-      canonicalBeta: nearest.beta,
-      confidence,
-      reliable,
-      distance,
-      rmseDb,
-      r2
-    };
-  }
-
-  function renderResult(result, psd, fit, interpretation) {
-    els.betaValue.textContent = Number.isFinite(result.beta) ? result.beta.toFixed(2) : '—';
-    els.r2Value.textContent = Number.isFinite(result.rmseDb) ? `${result.rmseDb.toFixed(2)} dB` : '—';
-    els.confidenceValue.textContent = result.confidence;
-    els.classification.textContent = result.classification;
-    els.fitEquation.textContent = Number.isFinite(fit.slope) ? `log₁₀P = ${fit.slope.toFixed(2)}·log₁₀f ${fit.intercept >= 0 ? '+' : '−'} ${Math.abs(fit.intercept).toFixed(2)}` : '—';
-
-    if (interpretation.reliable) {
-      els.classificationNote.textContent = `Nearest canonical slope: β = ${interpretation.canonicalBeta}. Fit used ${result.pointsUsed} frequency bins.`;
-      els.fitNote.textContent = `Residual ${result.rmseDb.toFixed(2)} dB; R² = ${result.r2.toFixed(2)}. Residual is the primary adequacy check because R² is not informative for an ideally flat white spectrum.`;
-      els.confidenceNote.textContent = `Distance from canonical β: ${interpretation.distance.toFixed(2)}.`;
-    } else {
-      els.classificationNote.textContent = `The selected spectrum is not well described by one canonical power-law color (β=${result.beta.toFixed(2)}, residual=${result.rmseDb.toFixed(2)} dB).`;
-      els.fitNote.textContent = `Residual ${result.rmseDb.toFixed(2)} dB; R² = ${result.r2.toFixed(2)}. Residual is too large or β is outside the standard color range.`;
-      els.confidenceNote.textContent = 'Try a steadier source, longer recording, or a different fit range.';
-    }
-
-    drawSpectrum(psd, fit, Number(els.minFreq.value), Math.min(Number(els.maxFreq.value), state.sampleRate * 0.48));
-    drawStoredWaveform();
-  }
-
-  function drawLive() {
-    if (!state.recording || !state.analyser) return;
-    const buf = new Float32Array(state.analyser.fftSize);
-    state.analyser.getFloatTimeDomainData(buf);
-    let sum = 0;
-    for (const v of buf) sum += v * v;
-    const rms = Math.sqrt(sum / buf.length);
-    const db = 20 * Math.log10(Math.max(rms, 1e-7));
-    const pct = Math.max(0, Math.min(100, (db + 60) / 60 * 100));
-    els.levelBar.style.width = `${pct}%`;
-    els.levelText.textContent = `Input ${db.toFixed(1)} dBFS`;
-    drawWave(els.waveCanvas, buf);
-    state.raf = requestAnimationFrame(drawLive);
-  }
-
-  function drawStoredWaveform() {
-    const seconds = Math.min(2, state.totalSamples / state.sampleRate);
-    const data = flattenChunks(seconds);
-    if (data.length) drawWave(els.waveCanvas, data);
-  }
-
-  function fitCanvas(canvas) {
-    const dpr = Math.max(1, Math.min(2, window.devicePixelRatio || 1));
-    const rect = canvas.getBoundingClientRect();
-    const cssWidth = Math.max(300, rect.width || canvas.width);
-    const aspect = canvas.getAttribute('height') / canvas.getAttribute('width');
-    const cssHeight = cssWidth * aspect;
-    const w = Math.round(cssWidth * dpr);
-    const h = Math.round(cssHeight * dpr);
-    if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
-    return { ctx: canvas.getContext('2d'), w, h, dpr };
-  }
-
-  function clearCanvas(canvas, message) {
-    const { ctx, w, h, dpr } = fitCanvas(canvas);
-    ctx.clearRect(0, 0, w, h);
-    ctx.fillStyle = '#78859f';
-    ctx.font = `${13 * dpr}px system-ui`;
-    ctx.textAlign = 'center';
-    ctx.fillText(message, w / 2, h / 2);
-  }
-
-  function drawWave(canvas, data) {
-    const { ctx, w, h, dpr } = fitCanvas(canvas);
-    ctx.clearRect(0, 0, w, h);
-    ctx.strokeStyle = 'rgba(255,255,255,.08)';
-    ctx.lineWidth = dpr;
-    ctx.beginPath(); ctx.moveTo(0, h / 2); ctx.lineTo(w, h / 2); ctx.stroke();
-    ctx.strokeStyle = '#7dd3fc';
-    ctx.lineWidth = 1.5 * dpr;
-    ctx.beginPath();
-    const step = Math.max(1, Math.floor(data.length / w));
-    for (let x = 0, idx = 0; x < w && idx < data.length; x++, idx += step) {
-      const y = h / 2 - data[idx] * h * 0.42;
-      if (x === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.stroke();
-  }
-
-  function drawSpectrum(psd, fit, minFit, maxFit) {
-    const { ctx, w, h, dpr } = fitCanvas(els.spectrumCanvas);
-    ctx.clearRect(0, 0, w, h);
-    const pad = { l: 68*dpr, r: 22*dpr, t: 20*dpr, b: 50*dpr };
-    const plotW = w - pad.l - pad.r;
-    const plotH = h - pad.t - pad.b;
-    const xMin = Math.log10(Math.max(20, psd.freqs[1] || 20));
-    const xMax = Math.log10(Math.min(psd.freqs[psd.freqs.length - 1], state.sampleRate * 0.48));
-    let yMin = Infinity, yMax = -Infinity;
-    for (let i = 1; i < psd.freqs.length; i++) {
-      const f = psd.freqs[i];
-      if (f < 20 || f > state.sampleRate * 0.48) continue;
-      const y = 10 * Math.log10(psd.power[i]);
-      if (Number.isFinite(y)) { yMin = Math.min(yMin, y); yMax = Math.max(yMax, y); }
-    }
-    if (!Number.isFinite(yMin) || yMax - yMin < 1) { yMin = -120; yMax = -20; }
-    const margin = Math.max(4, (yMax - yMin) * .08); yMin -= margin; yMax += margin;
-    const X = f => pad.l + (Math.log10(f) - xMin) / (xMax - xMin) * plotW;
-    const Y = db => pad.t + (yMax - db) / (yMax - yMin) * plotH;
-
-    ctx.strokeStyle = 'rgba(255,255,255,.08)'; ctx.fillStyle = '#8f9bb2'; ctx.lineWidth = dpr; ctx.font = `${11*dpr}px system-ui`;
-    const freqTicks = [20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000].filter(f => f >= 20 && f <= 10 ** xMax);
-    for (const f of freqTicks) {
-      const x = X(f); ctx.beginPath(); ctx.moveTo(x, pad.t); ctx.lineTo(x, h-pad.b); ctx.stroke();
-      ctx.textAlign = 'center'; ctx.fillText(f >= 1000 ? `${f/1000}k` : `${f}`, x, h - 22*dpr);
-    }
-    const yStep = (yMax - yMin) / 5;
-    for (let i = 0; i <= 5; i++) {
-      const db = yMin + i*yStep; const y = Y(db); ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(w-pad.r, y); ctx.stroke();
-      ctx.textAlign = 'right'; ctx.fillText(db.toFixed(0), pad.l - 8*dpr, y + 4*dpr);
-    }
-    ctx.textAlign = 'center'; ctx.fillText('Frequency (Hz, log scale)', pad.l + plotW/2, h - 4*dpr);
-    ctx.save(); ctx.translate(15*dpr, pad.t+plotH/2); ctx.rotate(-Math.PI/2); ctx.fillText('PSD (dB / Hz)', 0, 0); ctx.restore();
-
-    // Selected fit range.
-    ctx.fillStyle = 'rgba(125,211,252,.055)';
-    const fx1 = X(Math.max(minFit, 20)); const fx2 = X(Math.min(maxFit, 10**xMax));
-    ctx.fillRect(fx1, pad.t, Math.max(0, fx2-fx1), plotH);
-
-    // PSD curve.
-    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 1.25*dpr; ctx.beginPath(); let started = false;
-    for (let i = 1; i < psd.freqs.length; i++) {
-      const f = psd.freqs[i]; if (f < 20 || f > 10 ** xMax) continue;
-      const db = 10*Math.log10(psd.power[i]); if (!Number.isFinite(db)) continue;
-      const x = X(f), y = Y(db); if (!started) { ctx.moveTo(x,y); started = true; } else ctx.lineTo(x,y);
-    }
-    ctx.stroke();
-
-    // Fit line in dB units: 10 * log10(P).
-    if (Number.isFinite(fit.slope)) {
-      const f1 = Math.max(minFit, 20), f2 = Math.min(maxFit, 10 ** xMax);
-      const db1 = 10 * (fit.intercept + fit.slope * Math.log10(f1));
-      const db2 = 10 * (fit.intercept + fit.slope * Math.log10(f2));
-      ctx.strokeStyle = '#7dd3fc'; ctx.lineWidth = 3*dpr; ctx.beginPath(); ctx.moveTo(X(f1),Y(db1)); ctx.lineTo(X(f2),Y(db2)); ctx.stroke();
-    }
-  }
-
-  function download(filename, text, mime) {
-    const blob = new Blob([text], { type: mime });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
-  function exportJSON() {
-    if (!state.result) return;
-    download(`noisecolor-${Date.now()}.json`, JSON.stringify(state.result, null, 2), 'application/json');
-  }
-
-  function exportCSV() {
-    if (!state.result) return;
-    const r = state.result;
-    const rows = [
-      ['# NoiseColor measurement'],
-      ['# timestamp', r.timestamp],
-      ['# source_type', r.sourceType],
-      ['# source_name', r.sourceName || ''],
-      ['# duration_seconds', r.durationSeconds],
-      ['# sample_rate_hz', r.sampleRateHz],
-      ['# fit_min_hz', r.fitRangeHz[0]],
-      ['# fit_max_hz', r.fitRangeHz[1]],
-      ['# beta', r.beta],
-      ['# slope', r.slope],
-      ['# r_squared', r.r2],
-      ['# fit_rmse_db', r.rmseDb],
-      ['# fit_mae_db', r.maeDb],
-      ['# classification', r.classification],
-      ['# confidence', r.confidence],
-      [],
-      ['frequency_hz', 'power', 'power_db_per_hz', 'fitted_power_db_per_hz']
-    ];
-    for (let i = 1; i < r.frequenciesHz.length; i++) {
-      const f = r.frequenciesHz[i], p = r.power[i];
-      const fitted = 10 * (r.intercept + r.slope * Math.log10(f));
-      rows.push([f, p, 10*Math.log10(p), fitted]);
-    }
-    const csv = rows.map(row => row.map(v => {
-      const s = String(v ?? '');
-      return /[",\n]/.test(s) ? `"${s.replaceAll('"','""')}"` : s;
-    }).join(',')).join('\n');
-    download(`noisecolor-${Date.now()}.csv`, csv, 'text/csv');
-  }
-
-  function handleRangeChange() {
-    const min = Number(els.minFreq.value), max = Number(els.maxFreq.value);
-    if (min >= max) {
-      setStatus('The minimum fit frequency must be lower than the maximum.', 'warn');
-      return;
-    }
-    if (state.totalSamples >= (state.sampleRate || Infinity) * MIN_ANALYSIS_SECONDS) runAnalysis();
-  }
-
-  els.startBtn.addEventListener('click', startRecording);
-  els.stopBtn.addEventListener('click', stopRecording);
-  els.clearBtn.addEventListener('click', () => resetMeasurement(true));
-  els.audioFile.addEventListener('change', event => loadAudioFile(event.target.files?.[0]));
-  for (const eventName of ['dragenter', 'dragover']) {
-    els.fileDrop.addEventListener(eventName, event => {
-      event.preventDefault();
-      els.fileDrop.classList.add('dragging');
-    });
-  }
-  for (const eventName of ['dragleave', 'drop']) {
-    els.fileDrop.addEventListener(eventName, event => {
-      event.preventDefault();
-      els.fileDrop.classList.remove('dragging');
-    });
-  }
-  els.fileDrop.addEventListener('drop', event => loadAudioFile(event.dataTransfer?.files?.[0]));
-  els.jsonBtn.addEventListener('click', exportJSON);
-  els.csvBtn.addEventListener('click', exportCSV);
-  els.minFreq.addEventListener('change', handleRangeChange);
-  els.maxFreq.addEventListener('change', handleRangeChange);
-  els.windowSeconds.addEventListener('change', handleRangeChange);
-  window.addEventListener('resize', () => {
-    if (state.result) runAnalysis();
-    else { clearCanvas(els.spectrumCanvas, 'Record audio to see the power spectrum'); clearCanvas(els.waveCanvas, 'Waveform'); }
-  });
-  window.addEventListener('pagehide', stopMediaTracks);
-
-  updateEnvironmentBadge();
-  resetMeasurement(false);
-})();
-
-  </script>
+  </div>
+
+  <div id="installSheet" class="sheet-backdrop" hidden>
+    <section class="sheet" role="dialog" aria-modal="true" aria-labelledby="installSheetTitle">
+      <button id="closeInstallSheet" class="sheet-close" type="button" aria-label="Close installation instructions">Close</button>
+      <img src="./icons/icon-192.png" width="64" height="64" alt="" />
+      <p class="eyebrow">Installable web app</p>
+      <h2 id="installSheetTitle">Install NoiseColor</h2>
+      <div id="installInstructions"></div>
+    </section>
+  </div>
+
+  <noscript>NoiseColor requires JavaScript for local audio analysis.</noscript>
+  <script type="module" src="./app.js?v=0.6.6"></script>
 </body>
 </html>

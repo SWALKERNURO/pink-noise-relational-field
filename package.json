@@ -7,7 +7,8 @@
     "dev": "vite",
     "build": "vite build && node scripts/prepare-sites-build.mjs",
     "preview": "vite preview",
-    "test": "node --test tests/data.test.mjs tests/repository.test.mjs",
+    "test": "node --test tests/data.test.mjs tests/repository.test.mjs tests/noisecolor.test.mjs",
+    "test:noisecolor": "node --test tests/noisecolor.test.mjs",
     "test:sites": "node --test tests/sites-worker.test.mjs",
     "verify": "npm test && npm run build && npm run test:sites"
   },

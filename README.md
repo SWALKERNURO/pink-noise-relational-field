@@ -4,6 +4,19 @@ An interactive scientific visualization of posterior EEG 1/f structure, eye-move
 
 ![Pink Noise Relational Field interface](docs/design/implementation-measured-final.png)
 
+## Download / Install NoiseColor
+
+NoiseColor is a mobile-first Progressive Web App for live microphone spectral-color analysis. The installable PWA is the iPhone and Android app experience; it is not currently distributed through the Apple App Store or Google Play.
+
+<a href="https://swalkernuro.github.io/pink-noise-relational-field/noisecolor/?install=ios"><img src="docs/assets/install-noisecolor-iphone.png" alt="Install NoiseColor on iPhone" width="280"></a>
+<a href="https://swalkernuro.github.io/pink-noise-relational-field/noisecolor/?install=android"><img src="docs/assets/install-noisecolor-android.png" alt="Install NoiseColor on Android" width="280"></a>
+
+**[Open NoiseColor Web App](https://swalkernuro.github.io/pink-noise-relational-field/noisecolor/)**
+
+On iPhone or iPad, open the iPhone link in Safari, use **Share → Add to Home Screen**, enable/open as a web app where offered, and tap **Add**. On Android, the install control opens the native PWA prompt when Chromium exposes it; otherwise NoiseColor shows concise browser-specific instructions.
+
+**Audio is analyzed locally and is not uploaded to a server.** Live Analysis keeps only a bounded rolling buffer in memory and does not persist raw microphone audio. Recording and raw-audio download are explicit, opt-in actions.
+
 ## What is included
 
 - A full-screen temporal field with four stacked measured trajectories: posterior EEG exponent, horizontal EOG candidates, vertical EOG candidates, and blink rate.
@@ -33,18 +46,31 @@ This is an exploratory pilot visualization, not a diagnostic tool. The dataset r
 
 A changing EEG exponent and changing eye-movement rates can coexist without establishing a causal mechanism. The interface therefore labels the data as measured, keeps relational language interpretive, and presents unanswered questions separately.
 
-## NoiseColor audio input
+## NoiseColor audio input and scientific scope
 
 NoiseColor estimates the spectral exponent β in `P(f) ∝ 1/f^β` with Welch power spectral density and a log-log power-law fit. It supports:
 
-- live microphone capture over HTTPS or localhost;
+- continuous live microphone analysis over HTTPS or localhost, using fast and stable rolling estimators;
+- explicit, opt-in microphone recording with browser-detected recording formats, a two-minute capture cap, and bounded chunk memory;
 - local WAV, MP3, M4A, AAC, OGG, and FLAC files supported by the browser;
 - mono mixing for multichannel files;
-- files up to 100 MB, retaining the final 120 seconds for analysis;
-- selectable fit range and analysis window;
-- JSON and CSV export with source type and file name provenance.
+- PCM WAV files up to 40 MB, decoded directly from only the final bounded tail;
+- compressed files up to 12 MB and 120 seconds only after container layout, media duration, channel count, sample rate, and a 128 MiB peak simultaneous-memory estimate pass preflight;
+- temporal β analysis with mean, standard deviation, history, a 500 ms activity timeline, and separate whole-session counters that are not truncated with chart history;
+- continuous PSD, contextual third-octave bands, a live spectrogram, fit diagnostics, spectral flatness, signal level, and clipping checks;
+- optional, named, input-route-specific microphone frequency-response correction profiles;
+- local-only IndexedDB history for compact metadata and analysis summaries, never raw audio by default, limited to the 100 most recent saved results with mobile pagination over 25-record cursor pages;
+- reproducible JSON and CSV exports containing estimator, fit, quality, source, complete calibration correction points and hash, privacy-safe route labels, and version metadata.
+
+Uncompressed PCM WAV files are parsed directly so only the final bounded analysis window is converted to mono PCM. Browser `decodeAudioData()` cannot stream or decode only a tail, so compressed audio is rejected before decoding unless its container layout and duration can be inspected and the encoded buffer, decoded channel PCM, mono output, and conservative decoder/AudioContext overhead fit together under the mobile peak-memory limit. Potentially unsafe or unverifiable compressed containers are rejected with a conversion/trim explanation.
+
+The canonical β estimate always uses the **unweighted continuous PSD**. Third-octave and future acoustic weighting views are secondary context only and never drive noise-color classification. Scalar gain/SPL calibration does not materially change β; optional frequency-response correction can change β and is therefore reported transparently.
+
+NoiseColor does not force every sound into a canonical color. Silence, clipping or limiting, strongly tonal input, unstable β, insufficient duration, and poor or multi-regime single-power-law fits produce explicit quality states rather than a confident color label. Tonality uses flatness plus narrowband peak prominence and tonal-power diagnostics; model adequacy searches rolling breakpoints across log-frequency bins rather than relying on one fixed split. Limiting checks combine rail proximity, plateaus, level, crest factor, amplitude kurtosis, and near-edge sample density. Classification confidence is a model-quality heuristic tied to the same stable estimator shown by the primary label and β, not a statistical probability.
 
 Microphones and browser audio processing are not calibrated acoustic measurement chains. Use NoiseColor for exploratory or relative spectral analysis, not sound-pressure-level measurement.
+
+The analysis engine is independently implemented from standard FFT, Hann-window, Welch PSD, regression, spectral-flatness, and fractional-octave definitions. NoiseCapture informed product concepts only; no GPLv3 NoiseCapture source is copied, translated, ported, or adapted.
 
 ## Local development
 
@@ -65,7 +91,9 @@ Run the complete verification suite:
 npm run verify
 ```
 
-The suite validates CSV parsing and measured phase summaries, condition-summary wiring, NoiseColor file upload, repository hygiene, the production client build, the server worker fallback, and Sites packaging.
+The suite validates CSV parsing and measured phase summaries, condition-summary wiring, NoiseColor upload preflight, synthetic colored-noise recovery, tonal/limiting/model-quality gates, short-frame silence accounting, full-session aggregation, live-state transitions, history pagination, contrast/accessibility contracts, PWA scope, repository hygiene, the production client build, the server worker fallback, and Sites packaging.
+
+Local browser verification covers the `/noisecolor/` route, portrait layout, uploaded-audio analysis, scientific views, install instructions, manifest/icons, service-worker scope, offline launch, and the unchanged parent application. A final physical-device pass is still required for iPhone Safari and Android Chromium microphone permissions, installation prompts, safe-area behavior, calls/screen lock, Bluetooth route changes, and long-run thermal performance; those behaviors were not claimed as exercised in the desktop browser environment.
 
 Individual commands:
 
@@ -92,8 +120,9 @@ The worker and hosting manifest also allow the same verified build to be handed 
 ```text
 src/                    React interface and measured-data utilities
 public/data/            Validated pilot analysis tables and summary metadata
-public/noisecolor/      Standalone microphone/file spectral analyzer
+public/noisecolor/      Standalone NoiseColor PWA, analysis engine, workers, and mobile UI
 docs/design/            Selected visual target and design-QA screenshots
+docs/assets/            Custom NoiseColor install badges
 tests/                  Data, repository, and Sites worker tests
 worker/                 Static asset worker with app-shell fallback
 scripts/                Sites build preparation
