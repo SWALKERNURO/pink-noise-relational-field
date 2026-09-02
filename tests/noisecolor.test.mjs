@@ -81,6 +81,59 @@ function plausibleTransducerEq(frequency) {
   return 0.6 * Math.log2(frequency / 1000);
 }
 
+function normalizedAcousticFrequency(frequency, minimum = 100, maximum = 8000) {
+  const clamped = Math.min(maximum, Math.max(minimum, frequency));
+  return (Math.log10(clamped) - Math.log10(minimum)) / (Math.log10(maximum) - Math.log10(minimum));
+}
+
+function smoothSpeakerEq(frequency) {
+  const position = normalizedAcousticFrequency(frequency);
+  return 4 * Math.sin(2 * Math.PI * position) + 1.4 * Math.cos(Math.PI * position);
+}
+
+function smoothMicrophoneEq(frequency) {
+  const position = normalizedAcousticFrequency(frequency);
+  return 3 * Math.cos(2 * Math.PI * position + 0.4)
+    - 0.8 * Math.log10(Math.max(frequency, 100) / 1000);
+}
+
+function broadRoomCrossoverEq(frequency) {
+  const position = normalizedAcousticFrequency(frequency);
+  return 5.5 * Math.sin(2 * Math.PI * position + 0.6) + 2 * Math.cos(Math.PI * position);
+}
+
+function combinedAcousticEq(frequency) {
+  const position = normalizedAcousticFrequency(frequency);
+  const clamped = Math.min(8000, Math.max(100, frequency));
+  return 6 * Math.sin(2 * Math.PI * position) + 0.6 * Math.log10(clamped / 1000);
+}
+
+function reportedMeasurementEq(frequency) {
+  const position = normalizedAcousticFrequency(frequency);
+  const clamped = Math.min(8000, Math.max(100, frequency));
+  return 8.8 * Math.sin(2 * Math.PI * position) + 0.8 * Math.log10(clamped / 1000);
+}
+
+function extremeSmoothCurvature(frequency) {
+  return 14 * Math.sin(2 * Math.PI * normalizedAcousticFrequency(frequency));
+}
+
+function reportedAcousticFixture() {
+  const sampleRate = 44100;
+  const seconds = 30;
+  const sampleCount = sampleRate * seconds;
+  const fftSize = 2 ** 21;
+  const low = frequencyShapedColoredNoise(0.97, { sampleRate, size: fftSize, seed: 6808, rms: 0.08, responseDb: reportedMeasurementEq });
+  const high = frequencyShapedColoredNoise(1.05, { sampleRate, size: fftSize, seed: 7808, rms: 0.08, responseDb: reportedMeasurementEq });
+  const prefixRms = (samples) => Math.sqrt(samples.subarray(0, sampleCount).reduce((sum, sample) => sum + sample * sample, 0) / sampleCount);
+  const lowScale = 0.08 / prefixRms(low);
+  const highScale = 0.08 / prefixRms(high);
+  return Float32Array.from({ length: sampleCount }, (_, index) => {
+    const phase = Math.PI / 4 + 0.65 * Math.sin((2 * Math.PI * index) / (15 * sampleRate));
+    return Math.cos(phase) * low[index] * lowScale + Math.sin(phase) * high[index] * highScale;
+  });
+}
+
 function legacyTonalityDecision(result) {
   const frequencies = result.psd.frequencies;
   const power = result.psd.power;
@@ -105,6 +158,15 @@ function legacyTonalityDecision(result) {
   }
   const tonalPowerRatio = tonalExcess / totalPower;
   return result.spectralFlatness < 0.055 || (maximumProminenceDb >= 15 && tonalPowerRatio >= 0.06) || (maximumProminenceDb >= 24 && tonalPowerRatio >= 0.015);
+}
+
+function legacyModelAdequacyDecision(result) {
+  const fixedHalfMismatch = result.segmentedSlopeDelta > 0.75 && result.logBinnedRmseDb > 0.85;
+  const rollingBreakpointMismatch = result.maxBreakpointSlopeDelta >= 0.55
+    && result.piecewiseImprovementDb >= 0.012
+    && result.piecewiseRelativeImprovement >= 0.18
+    && result.breakpointEvidence >= 0.2;
+  return result.rmseDb > 5.2 || fixedHalfMismatch || rollingBreakpointMismatch;
 }
 
 function sineWave(frequency, { sampleRate = 16000, seconds = 4, amplitude = 0.3 } = {}) {
@@ -222,6 +284,64 @@ test("slope-normalized tonality preserves clean and transducer-shaped white, pin
   }
 });
 
+test("smooth speaker and microphone response curves preserve broadband canonical colors", () => {
+  const expected = [[0, "white"], [1, "pink"], [2, "brown"]];
+  for (const [beta, state] of expected) {
+    for (const [fixture, responseDb] of [["speaker", smoothSpeakerEq], ["microphone", smoothMicrophoneEq]]) {
+      const result = analyzeSamples(frequencyShapedColoredNoise(beta, { seed: 640 + beta, responseDb }), 16000, analysisOptions);
+      assert.equal(result.state, state, `${fixture} β ${beta} was ${result.classification}: ${result.qualityDetail}`);
+      assert.equal(result.reliable, true);
+      assert.notEqual(result.modelAdequacyStatus, "failed");
+    }
+  }
+});
+
+test("broad room/crossover and combined acoustic coloration remain broadband but reduce confidence", () => {
+  const expected = [[0, "white"], [1, "pink"], [2, "brown"]];
+  for (const [beta, state] of expected) {
+    const room = analyzeSamples(frequencyShapedColoredNoise(beta, { seed: 660 + beta, responseDb: broadRoomCrossoverEq }), 16000, analysisOptions);
+    assert.equal(room.state, state, `room/crossover β ${beta} was ${room.classification}: ${room.qualityDetail}`);
+    const combined = analyzeSamples(frequencyShapedColoredNoise(beta, { seed: 670 + beta, responseDb: combinedAcousticEq }), 16000, analysisOptions);
+    assert.equal(combined.state, state, `combined acoustic β ${beta} was ${combined.classification}: ${combined.qualityDetail}`);
+    assert.equal(combined.confidence, "Moderate");
+    assert.equal(combined.modelAdequacyStatus, "smooth-acoustic-coloration");
+    assert.ok(combined.smoothCurvatureMagnitudeDb > 8);
+    assert.ok(combined.abruptBreakpointImprovementDb < 0.04);
+  }
+});
+
+test("seeded acoustic coloration stress matrix preserves white, pink, and brown decisions", () => {
+  const expected = [[0, "white"], [1, "pink"], [2, "brown"]];
+  const responses = [["speaker", smoothSpeakerEq], ["microphone", smoothMicrophoneEq], ["room/crossover", broadRoomCrossoverEq], ["combined", combinedAcousticEq]];
+  for (const [beta, state] of expected) {
+    for (let seedOffset = 0; seedOffset < 3; seedOffset += 1) {
+      for (const [fixture, responseDb] of responses) {
+        const result = analyzeSamples(frequencyShapedColoredNoise(beta, { seed: 1000 + beta * 100 + seedOffset, responseDb }), 16000, analysisOptions);
+        assert.equal(result.state, state, `${fixture} β ${beta}, seed ${seedOffset}: ${result.classification} (${result.qualityDetail})`);
+        assert.equal(result.reliable, true);
+      }
+    }
+  }
+});
+
+test("reported 30-second 44.1 kHz acoustic fixture changes from legacy Mixed to Moderate Pink-like", () => {
+  const samples = reportedAcousticFixture();
+  const result = analyzeRecording(samples, 44100, { ...analysisOptions, fitRange: [100, 8000], maxWelchSegments: 96, temporalWindowSeconds: 6, temporalStepSeconds: 2 });
+  assert.equal(legacyModelAdequacyDecision(result), true, "fixture must reproduce the v0.6.7 model-adequacy rejection");
+  assert.equal(result.state, "pink", result.qualityDetail);
+  assert.equal(result.classification, "Pink-like");
+  assert.equal(result.confidence, "Moderate");
+  assert.equal(result.modelAdequacyStatus, "smooth-acoustic-coloration");
+  assert.ok(Math.abs(result.beta - 1.36) < 0.03, `β ${result.beta}`);
+  assert.ok(Math.abs(result.temporalBetaSd - 0.03) < 0.012, `temporal SD ${result.temporalBetaSd}`);
+  assert.ok(Math.abs(result.rmseDb - 3.9) < 0.25, `RMSE ${result.rmseDb}`);
+  assert.ok(Math.abs(result.r2 - 0.627) < 0.04, `R² ${result.r2}`);
+  assert.ok(Math.abs(result.spectralFlatness - 0.118) < 0.025, `flatness ${result.spectralFlatness}`);
+  assert.ok(result.smoothCurvatureMagnitudeDb > 10);
+  assert.ok(result.smoothResidualRmseDb < 0.5);
+  assert.ok(result.abruptBreakpointEvidence < 0.5);
+});
+
 test("realistic non-harmonic acoustic resonances no longer trigger the legacy tonal false positive", () => {
   const expected = [[0, "white"], [1, "pink"], [2, "brown"]];
   for (const [beta, state] of expected) {
@@ -263,11 +383,28 @@ test("pure, harmonic, and music-like tones retain conservative non-noise classif
   assert.equal(musicLike.reliable, false);
 });
 
+test("strong tones remain tonal after combined acoustic coloration", () => {
+  const broadband = frequencyShapedColoredNoise(1, { seed: 905, rms: 0.1, responseDb: combinedAcousticEq });
+  const result = analyzeSamples(addSinusoids(broadband, [[997, 0.16]]), 16000, analysisOptions);
+  assert.equal(result.state, "tonal", result.qualityDetail);
+  assert.equal(result.reliable, false);
+});
+
+test("gradual but extreme curvature remains Mixed rather than receiving a canonical color", () => {
+  const result = analyzeSamples(frequencyShapedColoredNoise(1, { seed: 915, responseDb: extremeSmoothCurvature }), 16000, analysisOptions);
+  assert.equal(result.state, "mixed", result.qualityDetail);
+  assert.equal(result.modelAdequacyStatus, "failed");
+  assert.match(result.qualityDetail, /extreme smooth curvature|excessive continuous-PSD residual/);
+});
+
 test("two-regime spectra fail the single-power-law adequacy gate", () => {
   const result = analyzeSamples(twoRegimeNoise(), 16000, analysisOptions);
   assert.equal(result.state, "mixed");
   assert.equal(result.reliable, false);
   assert.ok(result.segmentedSlopeDelta > 0.75);
+  assert.equal(result.modelAdequacyStatus, "failed");
+  assert.match(result.qualityDetail, /abrupt breakpoint evidence/);
+  assert.ok(result.abruptBreakpointEvidence > 1);
 });
 
 test("log-balanced breakpoint matrix rejects detectable two-regime spectra across the fit range", () => {
@@ -731,6 +868,11 @@ test("NoiseColor PWA paths and mobile lifecycle contracts stay scoped", async ()
   assert.match(app, /Persistent peaks/);
   assert.match(app, /Harmonic evidence/);
   assert.match(app, /Broadband occupancy/);
+  assert.match(app, /Nearest canonical target β/);
+  assert.match(app, /Smooth curvature/);
+  assert.match(app, /Smooth residual/);
+  assert.match(app, /Abrupt breakpoint Δβ/);
+  assert.match(app, /Model adequacy/);
   assert.match(html, /id="clearButton"/);
   assert.match(html, /role="tabpanel"/);
   assert.match(html, /aria-controls="panelSpectrum"/);
