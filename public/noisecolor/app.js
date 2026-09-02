@@ -5,13 +5,15 @@ import {
   DEFAULT_FIT_RANGE,
   FFT_SIZE,
   WELCH_OVERLAP,
+  SessionAccumulator,
   summarize,
   summarizeSession,
-} from "./analysis-engine.js?v=0.6.1";
-import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.1";
-import { clearMeasurements, deleteMeasurement, listMeasurements, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.1";
-import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.1";
-import { MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow } from "./live-runtime.js?v=0.6.1";
+} from "./analysis-engine.js?v=0.6.4";
+import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.4";
+import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.4";
+import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.4";
+import { MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow } from "./live-runtime.js?v=0.6.4";
+import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.4";
 
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 32 * 1024 * 1024;
@@ -24,7 +26,7 @@ const elements = Object.fromEntries([
   "instantBeta", "stability", "fitResidual", "signalLevel", "windowValue", "betaCanvas", "liveSummary", "summaryMetrics",
   "saveSummaryButton", "exportSummaryButton", "exportSummaryCsvButton", "recordTimer", "recordFormat", "recordButton", "stopRecordButton",
   "downloadAudioButton", "recordStatus", "recordResult", "fileDrop", "audioFile", "fileName", "uploadStatus",
-  "uploadResult", "clearHistoryButton", "historyList", "spectrumCanvas", "spectrumNote", "spectrogramCanvas",
+  "uploadResult", "clearHistoryButton", "historyList", "historyPrevious", "historyNext", "historyPageStatus", "spectrumCanvas", "spectrumNote", "spectrogramCanvas",
   "diagnosticGrid", "measuredCopy", "interpretationCopy", "calibrationFile", "calibrationProfile", "calibrationState",
   "scalarGain", "railMeasured", "railInterpretation", "railStatus", "versionLabel", "installSheet", "closeInstallSheet",
   "installInstructions", "privacyChip", "summaryTimeline", "betaDataSummary", "spectrumDataSummary", "spectrogramDataSummary",
@@ -58,6 +60,8 @@ const state = {
   spectrogramBusy: false,
   wakeLock: null,
   observations: [],
+  sessionAccumulator: null,
+  liveDisplay: null,
   betaHistory: [],
   latestResult: null,
   latestSpectrogram: null,
@@ -72,6 +76,7 @@ const state = {
   activeSpectrum: "psd",
   installPromptReady: false,
   currentView: "live",
+  historyOffset: 0,
   stopping: false,
   finalizingRecording: false,
   captureGeneration: 0,
@@ -120,7 +125,7 @@ function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) 
 
 function ensureWorker() {
   if (state.worker) return state.worker;
-  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.1", import.meta.url), { type: "module" });
+  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.4", import.meta.url), { type: "module" });
   state.worker.addEventListener("message", (event) => {
     const request = state.workerRequests.get(event.data.id);
     if (!request) return;
@@ -180,6 +185,7 @@ function setView(view) {
 }
 
 function displayLiveState(display, measurement = null) {
+  state.liveDisplay = display;
   elements.appShell.dataset.state = display.state;
   elements.liveStateLabel.textContent = display.state.replaceAll("-", " ").toUpperCase();
   elements.classification.textContent = display.label;
@@ -230,6 +236,7 @@ function clearAnalysisResults({ resetStatuses = true } = {}) {
   state.lastSummary = null;
   state.observations = [];
   state.betaHistory = [];
+  state.sessionAccumulator = null;
   clearResultContainer(elements.recordResult);
   clearResultContainer(elements.uploadResult);
   elements.liveSummary.hidden = true;
@@ -249,7 +256,7 @@ function clearAnalysisResults({ resetStatuses = true } = {}) {
   drawEmpty(elements.spectrogramCanvas, "No spectrogram available");
   clearStaleMeasurement("Ready", "listening", "Start Live Analysis or choose a local audio file.");
   if (resetStatuses) {
-    elements.fileName.textContent = "WAV, MP3, M4A, AAC, OGG, or FLAC · maximum 40 MB";
+    elements.fileName.textContent = "PCM WAV up to 40 MB · verified compressed audio up to 12 MB / 2 min";
     elements.uploadStatus.textContent = "Ready for a local audio file.";
     elements.recordStatus.textContent = "No audio is being recorded.";
     elements.recordTimer.textContent = "00:00";
@@ -348,6 +355,14 @@ async function startMicrophone({ recording = false } = {}) {
     state.audioContext = null;
     throw error;
   }
+  state.sampleRate = audioContext.sampleRate;
+  state.rolling = new RollingBuffer(Math.round(audioContext.sampleRate * ROLLING_SECONDS));
+  state.sessionAccumulator = new SessionAccumulator(audioContext.sampleRate);
+  const captureSamples = (samples) => {
+    if (!state.listening) return;
+    state.rolling?.push(samples);
+    state.sessionAccumulator?.addAudio(samples, state.liveDisplay);
+  };
   const sourceNode = audioContext.createMediaStreamSource(stream);
   const silentGain = audioContext.createGain();
   silentGain.gain.value = 0;
@@ -355,12 +370,12 @@ async function startMicrophone({ recording = false } = {}) {
 
   let captureNode;
   if (audioContext.audioWorklet) {
-    await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.1");
+    await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.4");
     captureNode = new AudioWorkletNode(audioContext, "noisecolor-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1] });
-    captureNode.port.onmessage = (event) => state.rolling?.push(event.data);
+    captureNode.port.onmessage = (event) => captureSamples(event.data);
   } else {
     captureNode = audioContext.createScriptProcessor(2048, 1, 1);
-    captureNode.onaudioprocess = (event) => state.rolling?.push(new Float32Array(event.inputBuffer.getChannelData(0)));
+    captureNode.onaudioprocess = (event) => captureSamples(new Float32Array(event.inputBuffer.getChannelData(0)));
   }
   sourceNode.connect(captureNode);
   captureNode.connect(silentGain);
@@ -368,8 +383,6 @@ async function startMicrophone({ recording = false } = {}) {
   state.sourceNode = sourceNode;
   state.captureNode = captureNode;
   state.silentGain = silentGain;
-  state.sampleRate = audioContext.sampleRate;
-  state.rolling = new RollingBuffer(Math.round(audioContext.sampleRate * ROLLING_SECONDS));
   state.listening = true;
   state.startedAt = performance.now();
   state.inputRoute = inputRouteFromTrack(track);
@@ -472,6 +485,7 @@ async function runStableAnalysis() {
     state.latestResult = result;
     const display = stateMachine.update(result);
     displayLiveState(display, result);
+    state.sessionAccumulator?.addObservation({ ...observation, beta: display.displayBeta, state: display.state, classification: display.label, reliable: display.reliable });
     const stableValues = state.observations.slice(-10).filter((item) => item.reliable).map((item) => item.beta);
     const stableSummary = summarize(stableValues);
     elements.stability.textContent = Number.isFinite(stableSummary.sd) ? `±${stableSummary.sd.toFixed(2)}` : "—";
@@ -512,8 +526,10 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
   state.captureGeneration += 1;
   stopSchedulers();
   const durationSeconds = state.startedAt ? (performance.now() - state.startedAt) / 1000 : 0;
-  if (!preserveSummary && state.observations.length) {
-    const session = summarizeSession(state.observations, durationSeconds);
+  if (!preserveSummary && state.sessionAccumulator?.durationSeconds > 0) {
+    state.sessionAccumulator.finish(state.liveDisplay);
+    const visualization = summarizeSession(state.observations, durationSeconds);
+    const session = state.sessionAccumulator.summary(state.observations, visualization.colorTimeline);
     const sessionReliable = Boolean(session.dominantReliableColor) && session.rejectedPercentage < 20;
     state.lastSummary = {
       ...session,
@@ -565,6 +581,7 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
     state.captureNode = null;
     state.silentGain = null;
     state.rolling = null;
+    state.sessionAccumulator = null;
     state.inputRoute = null;
     state.inputRouteLabel = null;
     state.constraintSettings = null;
@@ -764,6 +781,11 @@ async function loadAudioFile(file) {
     elements.uploadStatus.textContent = "This file is larger than the 40 MB phone-safe local-analysis limit.";
     return;
   }
+  const likelyWav = /(?:audio\/(?:wav|wave|x-wav))/.test(file.type || "") || /\.wav$/i.test(file.name || "");
+  if (!likelyWav && file.size > MAX_COMPRESSED_FILE_BYTES) {
+    elements.uploadStatus.textContent = "Compressed audio is limited to 12 MB before any file buffer or decoder is opened on mobile.";
+    return;
+  }
   elements.uploadStatus.textContent = "Decoding and analyzing locally…";
   let audioContext = null;
   try {
@@ -775,11 +797,12 @@ async function loadAudioFile(file) {
       bounded = wavTail;
       sampleRate = wavTail.sampleRate;
     } else {
-      const declaredWavRate = readWavSampleRate(encoded);
+      const preflight = await preflightCompressedUpload(file, encoded, readCompressedDuration);
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      try { audioContext = declaredWavRate ? new AudioContextClass({ sampleRate: declaredWavRate }) : new AudioContextClass(); }
+      try { audioContext = new AudioContextClass({ sampleRate: preflight.sampleRate }); }
       catch { audioContext = new AudioContextClass(); }
       const decoded = await audioContext.decodeAudioData(encoded);
+      if (decoded.duration > preflight.durationSeconds + 1 || decoded.numberOfChannels > preflight.channels || decoded.sampleRate > preflight.sampleRate) throw new Error("Decoded audio exceeded its verified preflight layout and was discarded.");
       bounded = selectBoundedAnalysisWindow(mixToMono(decoded), decoded.sampleRate);
       sampleRate = decoded.sampleRate;
     }
@@ -789,7 +812,7 @@ async function loadAudioFile(file) {
     renderResult(elements.uploadResult, result);
     renderAdvanced(result);
     const windowNote = result.analysisTruncated ? ` Analyzed the final ${formatDuration(result.durationSeconds)} of ${formatDuration(result.sourceDurationSeconds)}.` : ` Analyzed ${formatDuration(result.durationSeconds)}.`;
-    const decodeNote = wavTail ? "PCM WAV was decoded directly from the bounded analysis tail." : "This compressed format required browser decoding before the final analysis window was selected.";
+    const decodeNote = wavTail ? "PCM WAV was decoded directly from the bounded analysis tail." : "Compressed duration, sample rate, channels, and decoded-memory estimate passed preflight before browser decoding.";
     elements.uploadStatus.textContent = `${windowNote} ${result.sampleRate} Hz. ${decodeNote} No audio left this device.`;
   } catch (error) {
     if (analysisGeneration !== state.analysisGeneration) return;
@@ -801,13 +824,26 @@ async function loadAudioFile(file) {
   }
 }
 
-function readWavSampleRate(arrayBuffer) {
-  if (arrayBuffer.byteLength < 28) return null;
-  const bytes = new Uint8Array(arrayBuffer, 0, 12);
-  const text = String.fromCharCode(...bytes);
-  if (!text.startsWith("RIFF") || !text.includes("WAVE")) return null;
-  const rate = new DataView(arrayBuffer).getUint32(24, true);
-  return rate >= 4000 && rate <= 384000 ? rate : null;
+function readCompressedDuration(file, timeoutMs = 5000) {
+  return new Promise((resolve, reject) => {
+    const audio = document.createElement("audio");
+    const url = URL.createObjectURL(file);
+    let settled = false;
+    const finish = (callback, value) => {
+      if (settled) return;
+      settled = true;
+      window.clearTimeout(timeoutId);
+      audio.removeAttribute("src");
+      audio.load();
+      URL.revokeObjectURL(url);
+      callback(value);
+    };
+    const timeoutId = window.setTimeout(() => finish(reject, new Error("Compressed-audio metadata inspection timed out before decoding.")), timeoutMs);
+    audio.preload = "metadata";
+    audio.addEventListener("loadedmetadata", () => finish(Number.isFinite(audio.duration) && audio.duration > 0 ? resolve : reject, Number.isFinite(audio.duration) && audio.duration > 0 ? audio.duration : new Error("Compressed-audio duration is unavailable.")), { once: true });
+    audio.addEventListener("error", () => finish(reject, new Error("Compressed-audio metadata could not be inspected safely.")), { once: true });
+    audio.src = url;
+  });
 }
 
 function decodePcmWavTail(arrayBuffer, maxSeconds = 120) {
@@ -934,7 +970,8 @@ function exportCsv(result) {
     ["microphone settings", result.microphoneSettings ? JSON.stringify(result.microphoneSettings) : ""],
     ["peak prominence dB", result.maxPeakProminenceDb], ["tonal power ratio", result.tonalPowerRatio],
     ["low-band beta", result.lowBandBeta], ["high-band beta", result.highBandBeta], ["segmented slope delta", result.segmentedSlopeDelta],
-    ["near-clip ratio", result.nearClipRatio], ["plateau ratio", result.plateauRatio], ["crest factor", result.crestFactor], ["limiting suspected", result.limitingSuspected],
+    ["maximum breakpoint slope delta", result.maxBreakpointSlopeDelta], ["strongest breakpoint Hz", result.strongestBreakpointFrequency], ["piecewise fit improvement dB", result.piecewiseImprovementDb],
+    ["near-clip ratio", result.nearClipRatio], ["plateau ratio", result.plateauRatio], ["crest factor", result.crestFactor], ["amplitude kurtosis", result.amplitudeKurtosis], ["edge density ratio", result.edgeDensityRatio], ["limiting suspected", result.limitingSuspected],
   ];
   const rows = metadata.map(([key, value]) => `# ${key},${JSON.stringify(value ?? "")}`);
   rows.push("", "time_seconds,start_seconds,end_seconds,beta,state,classification,reliable,rmse_db,r_squared,spectral_flatness");
@@ -946,7 +983,18 @@ function exportCsv(result) {
 
 async function refreshHistory() {
   try {
-    const records = await listMeasurements();
+    const page = await listMeasurementPage({ offset: state.historyOffset });
+    const records = page.records;
+    if (!records.length && state.historyOffset > 0) {
+      state.historyOffset = Math.max(0, state.historyOffset - HISTORY_PAGE_SIZE);
+      await refreshHistory();
+      return;
+    }
+    elements.historyPrevious.disabled = !page.pagination.hasPrevious;
+    elements.historyNext.disabled = !page.pagination.hasNext;
+    elements.historyPageStatus.textContent = records.length
+      ? `Page ${page.pagination.pageNumber} · results ${page.pagination.firstRecord}–${page.pagination.lastRecord}`
+      : "Page 1 · no results";
     if (!records.length) {
       elements.historyList.innerHTML = '<p class="empty-state">No saved measurements yet. Live summaries and recording results are saved only when you ask.</p>';
       return;
@@ -964,6 +1012,8 @@ async function refreshHistory() {
     }
   } catch (error) {
     elements.historyList.innerHTML = `<p class="empty-state">${escapeHtml(error.message)}</p>`;
+    elements.historyPrevious.disabled = true;
+    elements.historyNext.disabled = true;
   }
 }
 
@@ -1117,7 +1167,7 @@ function renderAdvanced(result) {
   const diagnostics = [
     ["β", formatNumber(result.beta)], ["R²", formatNumber(result.r2, 3)], ["RMSE", formatNumber(result.rmseDb, 2, " dB")], ["MAE", formatNumber(result.maeDb, 2, " dB")],
     ["Flatness", formatNumber(result.spectralFlatness, 3)], ["Level", formatNumber(result.dbfs, 1, " dBFS")], ["Clipping", formatNumber(result.clippingRatio * 100, 3, "%")], ["Near clip", formatNumber(result.nearClipRatio * 100, 2, "%")],
-    ["Crest factor", formatNumber(result.crestFactor, 2)], ["Peak prominence", formatNumber(result.maxPeakProminenceDb, 1, " dB")], ["Tonal power", formatNumber(result.tonalPowerRatio * 100, 1, "%")], ["Slope delta", formatNumber(result.segmentedSlopeDelta, 2)],
+    ["Crest factor", formatNumber(result.crestFactor, 2)], ["Amplitude kurtosis", formatNumber(result.amplitudeKurtosis, 2)], ["Edge density", formatNumber(result.edgeDensityRatio * 100, 1, "%")], ["Peak prominence", formatNumber(result.maxPeakProminenceDb, 1, " dB")], ["Tonal power", formatNumber(result.tonalPowerRatio * 100, 1, "%")], ["Breakpoint Δβ", formatNumber(result.maxBreakpointSlopeDelta, 2)],
     ["Fit range", `${result.fitRange?.[0]}–${Math.round(result.fitRange?.[1] || 0)} Hz`],
     ["Sample rate", `${result.sampleRate} Hz`], ["Welch", `${result.fftSize} FFT · ${result.welchOverlap * 100}% overlap`], ["Correction", result.calibrationProfile || "Uncorrected"], ["Engine", `v${result.analysisEngineVersion}`],
   ];
@@ -1241,7 +1291,9 @@ elements.audioFile.addEventListener("change", (event) => loadAudioFile(event.tar
 for (const name of ["dragenter", "dragover"]) elements.fileDrop.addEventListener(name, (event) => { event.preventDefault(); elements.fileDrop.classList.add("dragging"); });
 for (const name of ["dragleave", "drop"]) elements.fileDrop.addEventListener(name, (event) => { event.preventDefault(); elements.fileDrop.classList.remove("dragging"); });
 elements.fileDrop.addEventListener("drop", (event) => loadAudioFile(event.dataTransfer?.files?.[0]));
-elements.clearHistoryButton.addEventListener("click", async () => { if (window.confirm("Delete all locally saved NoiseColor results?")) { await clearMeasurements(); refreshHistory(); } });
+elements.clearHistoryButton.addEventListener("click", async () => { if (window.confirm("Delete all locally saved NoiseColor results?")) { await clearMeasurements(); state.historyOffset = 0; refreshHistory(); } });
+elements.historyPrevious.addEventListener("click", () => { state.historyOffset = Math.max(0, state.historyOffset - HISTORY_PAGE_SIZE); refreshHistory(); });
+elements.historyNext.addEventListener("click", () => { state.historyOffset += HISTORY_PAGE_SIZE; refreshHistory(); });
 elements.saveSummaryButton.addEventListener("click", async () => { if (state.lastSummary) { await saveMeasurement(state.lastSummary); elements.saveSummaryButton.textContent = "Saved locally"; elements.saveSummaryButton.disabled = true; } });
 elements.exportSummaryButton.addEventListener("click", () => state.lastSummary && exportJson(state.lastSummary));
 elements.exportSummaryCsvButton.addEventListener("click", () => state.lastSummary && exportCsv(state.lastSummary));

@@ -4,8 +4,10 @@ import test from "node:test";
 import {
   APP_VERSION,
   ENGINE_VERSION,
+  SessionAccumulator,
   analyzeRecording,
   analyzeSamples,
+  buildActivityTimeline,
   buildColorTimeline,
   fftInPlace,
   summarizeSession,
@@ -14,7 +16,8 @@ import {
 } from "../public/noisecolor/analysis-engine.js";
 import { ColorStateMachine } from "../public/noisecolor/live-state.js";
 import { MODE_CONFIG, RollingBuffer, selectBoundedAnalysisWindow } from "../public/noisecolor/live-runtime.js";
-import { compactMeasurement, HISTORY_PAGE_SIZE, HISTORY_RETENTION_LIMIT } from "../public/noisecolor/history.js";
+import { compactMeasurement, historyPaginationState, HISTORY_PAGE_SIZE, HISTORY_RETENTION_LIMIT } from "../public/noisecolor/history.js";
+import { assessCompressedUploadSafety, inspectCompressedLayout, preflightCompressedUpload } from "../public/noisecolor/upload-safety.js";
 
 function randomGenerator(seed = 123456789) {
   let value = seed >>> 0;
@@ -150,6 +153,16 @@ test("two-regime spectra fail the single-power-law adequacy gate", () => {
   assert.ok(result.segmentedSlopeDelta > 0.75);
 });
 
+test("multi-breakpoint adequacy rejects strong slope changes away from the midpoint", () => {
+  for (const breakpoint of [500, 1000, 2000, 4000]) {
+    const result = analyzeSamples(twoRegimeNoise({ breakpoint, seed: 730 + breakpoint }), 16000, analysisOptions);
+    assert.equal(result.reliable, false, `breakpoint ${breakpoint} Hz was incorrectly reliable (β ${result.beta})`);
+    assert.equal(result.state, "mixed", `breakpoint ${breakpoint} Hz should fail the single-power-law gate`);
+    assert.ok(result.maxBreakpointSlopeDelta > 0.85, `breakpoint ${breakpoint} Hz produced Δβ ${result.maxBreakpointSlopeDelta}`);
+    assert.ok(result.piecewiseImprovementDb > 0.32, `breakpoint ${breakpoint} Hz improvement was ${result.piecewiseImprovementDb} dB`);
+  }
+});
+
 test("quality gates reject tonal input, silence, clipping, and short input", () => {
   const tonal = analyzeSamples(sineWave(1000), 16000, analysisOptions);
   assert.equal(tonal.state, "tonal");
@@ -175,6 +188,16 @@ test("mobile-style limiting below full scale is reported conservatively", () => 
   assert.equal(result.limitingSuspected, true);
   assert.equal(result.state, "clipping");
   assert.match(result.qualityDetail, /clipped or aggressively limited/i);
+});
+
+test("smooth aggressive tanh limiting cannot receive high-confidence broadband classification", () => {
+  const source = coloredNoise(0, { seed: 1602, rms: 0.18 });
+  const limited = Float32Array.from(source, (sample) => 0.98 * Math.tanh(8 * sample));
+  const result = analyzeSamples(limited, 16000, analysisOptions);
+  assert.equal(result.limitingSuspected, true);
+  assert.equal(result.state, "clipping");
+  assert.equal(result.reliable, false);
+  assert.ok(result.amplitudeKurtosis < 1.9 || result.edgeDensityRatio > 0.08);
 });
 
 test("quality gates reject non-finite and poor single-power-law signals", () => {
@@ -214,6 +237,22 @@ test("intermittent silence is represented by actual analyzed time", () => {
   assert.equal(result.reliable, false);
   assert.equal(result.state, "silence");
   assert.ok(result.temporalBeta.every((item) => Number.isFinite(item.rmseDb) && Number.isFinite(item.r2) && Number.isFinite(item.spectralFlatness)));
+});
+
+test("short-frame activity accounting preserves 50% silence across 2/3/4/6/8-second blocks", () => {
+  const sampleRate = 8192;
+  const source = coloredNoise(1, { sampleRate, size: 262144, seed: 1222, rms: 0.16 });
+  for (const blockSeconds of [2, 3, 4, 6, 8]) {
+    const blockSize = blockSeconds * sampleRate;
+    const samples = new Float32Array(blockSize * 4);
+    samples.set(source.subarray(0, blockSize), 0);
+    samples.set(source.subarray(blockSize, blockSize * 2), blockSize * 2);
+    const result = analyzeRecording(samples, sampleRate, { ...analysisOptions, temporalWindowSeconds: 6, temporalStepSeconds: 2, activityFrameSeconds: 0.5 });
+    assert.ok(Math.abs(result.sessionSummary.percentages.silence - 50) <= 0.5, `${blockSeconds}s blocks reported ${result.sessionSummary.percentages.silence}% silence`);
+    const activity = buildActivityTimeline(samples, sampleRate, result.temporalBeta, 0.5);
+    const silenceSeconds = activity.filter((segment) => segment.state === "silence").reduce((sum, segment) => sum + segment.endSeconds - segment.startSeconds, 0);
+    assert.ok(Math.abs(silenceSeconds - blockSeconds * 2) <= 0.05);
+  }
 });
 
 test("low sample-rate analysis caps the fit range below Nyquist", () => {
@@ -294,6 +333,28 @@ test("rolling capture wraps by chunk and file analysis is bounded to the final 1
   assert.ok(MODE_CONFIG.balanced.fastEveryMs < MODE_CONFIG.balanced.stableEveryMs);
 });
 
+test("compressed uploads require verified bounded decoded-memory preflight", async () => {
+  const mp3Frame = new Uint8Array(417);
+  mp3Frame.set([0xff, 0xfb, 0x90, 0x00]);
+  const layout = inspectCompressedLayout(mp3Frame.buffer);
+  assert.deepEqual(layout, { container: "mp3", sampleRate: 44100, channels: 2, metadataVerified: true });
+  const m4a = new Uint8Array(52);
+  m4a.set([0x66, 0x74, 0x79, 0x70], 4);
+  m4a.set([0x6d, 0x70, 0x34, 0x61], 20);
+  const m4aView = new DataView(m4a.buffer);
+  m4aView.setUint16(40, 2, false);
+  m4aView.setUint32(48, 48000 << 16, false);
+  assert.deepEqual(inspectCompressedLayout(m4a.buffer), { container: "mp4-audio", sampleRate: 48000, channels: 2, metadataVerified: true });
+  const safe = assessCompressedUploadSafety({ encodedBytes: 1024 * 1024, durationSeconds: 60, ...layout });
+  assert.equal(safe.safe, true);
+  assert.equal(assessCompressedUploadSafety({ encodedBytes: 1024 * 1024, durationSeconds: 121, ...layout }).safe, false);
+  assert.equal(assessCompressedUploadSafety({ encodedBytes: 1024 * 1024, durationSeconds: 60, sampleRate: null, channels: null, metadataVerified: false }).safe, false);
+  assert.equal(assessCompressedUploadSafety({ encodedBytes: 1024 * 1024, durationSeconds: 120, sampleRate: 192000, channels: 8, metadataVerified: true }).safe, false);
+  const preflight = await preflightCompressedUpload({ size: 1024 * 1024 }, mp3Frame.buffer, async () => 60);
+  assert.equal(preflight.durationSeconds, 60);
+  await assert.rejects(() => preflightCompressedUpload({ size: 1024 * 1024 }, new Uint8Array(32).buffer, async () => 1), /cannot be safely inspected/);
+});
+
 test("the primary live estimator waits for the full selected stable window", async () => {
   const app = await readFile(new URL("../public/noisecolor/app.js", import.meta.url), "utf8");
   assert.match(app, /state\.rolling\.length < state\.sampleRate \* config\.stableSeconds/);
@@ -348,6 +409,47 @@ test("live color state machine uses consecutive observations and clears stale co
   assert.equal(silence.displayBeta, null);
 });
 
+test("pink to white to blue transitions keep stable label, beta, and confidence coherent", () => {
+  const machine = new ColorStateMachine({ alpha: 1, hysteresis: 0, requiredObservations: 2 });
+  const measurement = (beta, state, classification) => ({ beta, state, classification, reliable: true, confidence: "High", rmseDb: 1, qualityDetail: "Reliable." });
+  machine.update(measurement(1, "pink", "Pink-like"));
+  const pink = machine.update(measurement(1, "pink", "Pink-like"));
+  assert.deepEqual([pink.state, pink.label, pink.displayBeta, pink.confidence], ["pink", "Pink-like", 1, "High"]);
+  const pendingWhite = machine.update(measurement(0, "white", "White-like"));
+  assert.deepEqual([pendingWhite.state, pendingWhite.label, pendingWhite.displayBeta, pendingWhite.confidence], ["pink", "Pink-like", 1, "Provisional"]);
+  const white = machine.update(measurement(0, "white", "White-like"));
+  assert.deepEqual([white.state, white.label, white.displayBeta, white.confidence], ["white", "White-like", 0, "High"]);
+  const pendingBlue = machine.update(measurement(-1, "blue", "Blue-like"));
+  assert.deepEqual([pendingBlue.state, pendingBlue.label, pendingBlue.displayBeta, pendingBlue.confidence], ["white", "White-like", 0, "Provisional"]);
+  const blue = machine.update(measurement(-1, "blue", "Blue-like"));
+  assert.deepEqual([blue.state, blue.label, blue.displayBeta, blue.confidence], ["blue", "Blue-like", -1, "High"]);
+  const noisyConfidence = machine.update({ ...measurement(-1, "blue", "Blue-like"), temporalSd: 0.4 });
+  assert.equal(noisyConfidence.confidence, "Low");
+});
+
+test("full-session accumulator survives visualization retention truncation", () => {
+  const sampleRate = 100;
+  const accumulator = new SessionAccumulator(sampleRate, 0.5);
+  const frame = Float32Array.from({ length: 50 }, (_, index) => 0.1 * Math.sin(index * 0.71) + 0.03 * Math.sin(index * 1.37));
+  const retained = [];
+  for (let index = 0; index < 4001; index += 1) {
+    const pink = index >= 500;
+    const observation = { timeSeconds: index * 0.5, beta: pink ? 1 : 0, state: pink ? "pink" : "white", classification: pink ? "Pink-like" : "White-like", reliable: true, rmseDb: 1, r2: 0.8, spectralFlatness: 0.7 };
+    accumulator.addAudio(frame, observation);
+    accumulator.addObservation(observation);
+    retained.push(observation);
+    if (retained.length > 3600) retained.shift();
+  }
+  const summary = accumulator.summary(retained);
+  assert.equal(retained.length, 3600);
+  assert.equal(summary.aggregateObservationCount, 4001);
+  assert.equal(summary.sessionDurationSeconds, 2000.5);
+  assert.ok(Math.abs(summary.percentages.white - (500 / 4001) * 100) < 0.01);
+  assert.ok(Math.abs(summary.percentages.pink - (3501 / 4001) * 100) < 0.01);
+  assert.ok(Math.abs(summary.betaMean - 3501 / 4001) < 1e-9);
+  assert.equal(summary.statisticsCoverFullSession, true);
+});
+
 test("NoiseColor PWA paths and mobile lifecycle contracts stay scoped", async () => {
   const [manifestText, serviceWorker, html, styles, pwa, app, worker, liveState] = await Promise.all([
     readFile(new URL("../public/noisecolor/manifest.webmanifest", import.meta.url), "utf8"),
@@ -398,6 +500,9 @@ test("NoiseColor PWA paths and mobile lifecycle contracts stay scoped", async ()
   assert.match(app, /MAX_RECORDING_SECONDS/);
   assert.match(app, /MAX_RECORDING_BYTES/);
   assert.match(app, /decodePcmWavTail/);
+  assert.match(app, /preflightCompressedUpload/);
+  assert.match(serviceWorker, /upload-safety\.js/);
+  assert.match(html, /id="historyPageStatus" role="status" aria-live="polite"/);
   assert.match(app, /state\.workerBusy/);
   assert.match(html, /id="clearButton"/);
   assert.match(html, /role="tabpanel"/);
@@ -472,11 +577,53 @@ test("history compaction bounds detail arrays and removes persistent identifiers
   assert.equal(HISTORY_RETENTION_LIMIT, 100);
 });
 
+test("history pagination exposes records 26 through 100 without unbounded reads", async () => {
+  const first = historyPaginationState(0, 25, true);
+  const second = historyPaginationState(first.nextOffset, 25, true);
+  const fourth = historyPaginationState(75, 25, false);
+  assert.deepEqual([first.pageNumber, first.hasPrevious, first.hasNext, first.firstRecord, first.lastRecord], [1, false, true, 1, 25]);
+  assert.deepEqual([second.pageNumber, second.previousOffset, second.nextOffset, second.firstRecord, second.lastRecord], [2, 0, 50, 26, 50]);
+  assert.deepEqual([fourth.pageNumber, fourth.hasNext, fourth.firstRecord, fourth.lastRecord], [4, false, 76, 100]);
+  const [app, history, html] = await Promise.all([
+    readFile(new URL("../public/noisecolor/app.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/noisecolor/history.js", import.meta.url), "utf8"),
+    readFile(new URL("../public/noisecolor/index.html", import.meta.url), "utf8"),
+  ]);
+  assert.match(app, /listMeasurementPage\(\{ offset: state\.historyOffset \}\)/);
+  assert.match(app, /historyNext\.addEventListener/);
+  assert.match(app, /historyPrevious\.addEventListener/);
+  assert.doesNotMatch(history, /getAll\s*\(/);
+  assert.match(html, /id="historyPrevious"/);
+  assert.match(html, /id="historyNext"/);
+});
+
+test("small and dim text colors meet AA contrast and calibration changes are announced", async () => {
+  const [styles, html] = await Promise.all([
+    readFile(new URL("../public/noisecolor/styles.css", import.meta.url), "utf8"),
+    readFile(new URL("../public/noisecolor/index.html", import.meta.url), "utf8"),
+  ]);
+  const color = (name) => styles.match(new RegExp(`--${name}:\\s*(#[0-9a-f]{6})`, "i"))?.[1];
+  const luminance = (hex) => {
+    const channels = [1, 3, 5].map((offset) => parseInt(hex.slice(offset, offset + 2), 16) / 255).map((value) => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2];
+  };
+  const contrast = (foreground, background) => {
+    const [light, dark] = [luminance(foreground), luminance(background)].sort((left, right) => right - left);
+    return (light + 0.05) / (dark + 0.05);
+  };
+  for (const foreground of [color("muted"), color("dim")]) {
+    assert.ok(contrast(foreground, color("surface")) >= 4.5, `${foreground} does not meet AA on ${color("surface")}`);
+    assert.ok(contrast(foreground, color("bg")) >= 4.5, `${foreground} does not meet AA on ${color("bg")}`);
+  }
+  assert.match(html, /id="calibrationState" role="status" aria-live="polite" aria-atomic="true"/);
+});
+
 test("upload rejection and Clear reset stale result surfaces before reporting failure", async () => {
   const app = await readFile(new URL("../public/noisecolor/app.js", import.meta.url), "utf8");
   const upload = app.slice(app.indexOf("async function loadAudioFile"), app.indexOf("function readWavSampleRate"));
   assert.ok(upload.indexOf("clearAnalysisResults") < upload.indexOf("file.size > MAX_FILE_BYTES"));
   assert.match(upload, /catch \(error\) \{\s*if \(analysisGeneration !== state\.analysisGeneration\) return;\s*clearAnalysisResults/);
+  assert.ok(upload.indexOf("preflightCompressedUpload") < upload.indexOf("decodeAudioData"));
   assert.match(app, /async function resetApplication\(\)/);
   assert.match(app, /releaseRecordingObject\(\)/);
   assert.match(app, /elements\.clearButton\.addEventListener\("click", resetApplication\)/);

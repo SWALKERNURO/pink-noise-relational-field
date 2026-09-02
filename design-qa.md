@@ -140,6 +140,16 @@ The portrait capture is the focused evidence because phone use is the primary No
 - The waiting v0.6.1 service worker activated through the visible update control; after the preview server stopped, `/noisecolor/` reloaded as v0.6.1 from the offline shell.
 - Reload checks produced no browser page errors or console output.
 
+## v0.6.4 adversarial remediation verification
+
+- The final versioned worker activated through the visible update control and the complete app reloaded from its scoped cache with the preview server stopped.
+- Clear/reset returned the primary classification, stable β, diagnostics, charts, and result surfaces to their initial state.
+- History exposes Previous/Next controls and a live page range; the 25-record cursor pagination state was exercised through pages 1–4 in automated coverage without `getAll()`.
+- Calibration is exposed as a polite atomic live status inside its selected tabpanel.
+- At 320, 390, and 768 px, Clear and Install remained visible and the document reported no horizontal overflow; the History pagination row remained within the phone workspace.
+- The root Pink Noise Relational Field retained its heading, measured trajectories, interpretation rails, and playback controls.
+- The browser runtime rendered the updated upload, History, calibration, reset, responsive, parent-app, service-worker-update, and offline states without a visible error state.
+
 ## Follow-up polish
 
 - [P3] The desktop idle β field is intentionally quieter than the source's measured temporal ribbons. Once listening begins, live β history, PSD, and spectrogram data provide the corresponding visual density without fabricating an idle trace.

@@ -54,19 +54,19 @@ NoiseColor estimates the spectral exponent β in `P(f) ∝ 1/f^β` with Welch po
 - explicit, opt-in microphone recording with browser-detected recording formats, a two-minute capture cap, and bounded chunk memory;
 - local WAV, MP3, M4A, AAC, OGG, and FLAC files supported by the browser;
 - mono mixing for multichannel files;
-- files up to 40 MB;
-- a bounded final 120-second analysis window for longer recordings/files, with the full source duration and analyzed offset retained in exports;
-- temporal β analysis with mean, standard deviation, history, and a color timeline;
+- PCM WAV files up to 40 MB, decoded directly from only the final bounded tail;
+- compressed files up to 12 MB and 120 seconds only after container layout, media duration, channel count, sample rate, and a 128 MB decoded-working-memory estimate pass preflight;
+- temporal β analysis with mean, standard deviation, history, a 500 ms activity timeline, and separate whole-session counters that are not truncated with chart history;
 - continuous PSD, contextual third-octave bands, a live spectrogram, fit diagnostics, spectral flatness, signal level, and clipping checks;
 - optional, named, input-route-specific microphone frequency-response correction profiles;
-- local-only IndexedDB history for compact metadata and analysis summaries, never raw audio by default, limited to the 100 most recent saved results and 25 records per read;
+- local-only IndexedDB history for compact metadata and analysis summaries, never raw audio by default, limited to the 100 most recent saved results with mobile pagination over 25-record cursor pages;
 - reproducible JSON and CSV exports containing estimator, fit, quality, source, complete calibration correction points and hash, privacy-safe route labels, and version metadata.
 
-Uncompressed PCM WAV files are parsed directly so only the final bounded analysis window is converted to mono PCM. Browser-supported compressed formats must still be decoded by the browser before NoiseColor can select the final window; the 40 MB file cap reduces but cannot eliminate that unavoidable peak-memory limitation on phones.
+Uncompressed PCM WAV files are parsed directly so only the final bounded analysis window is converted to mono PCM. Browser `decodeAudioData()` cannot stream or decode only a tail, so compressed audio is rejected before decoding unless its container layout and duration can be inspected and its complete decoded working set stays within the conservative mobile limit. Potentially unsafe or unverifiable compressed containers are rejected with a conversion/trim explanation.
 
 The canonical β estimate always uses the **unweighted continuous PSD**. Third-octave and future acoustic weighting views are secondary context only and never drive noise-color classification. Scalar gain/SPL calibration does not materially change β; optional frequency-response correction can change β and is therefore reported transparently.
 
-NoiseColor does not force every sound into a canonical color. Silence, clipping or limiting, strongly tonal input, unstable β, insufficient duration, and poor or two-regime single-power-law fits produce explicit quality states rather than a confident color label. Tonality uses flatness plus narrowband peak prominence and tonal-power diagnostics; model adequacy compares log-frequency-binned low/high-band slopes so dense high-frequency bins cannot hide strong curvature. Classification confidence is a model-quality heuristic, not a statistical probability.
+NoiseColor does not force every sound into a canonical color. Silence, clipping or limiting, strongly tonal input, unstable β, insufficient duration, and poor or multi-regime single-power-law fits produce explicit quality states rather than a confident color label. Tonality uses flatness plus narrowband peak prominence and tonal-power diagnostics; model adequacy searches rolling breakpoints across log-frequency bins rather than relying on one fixed split. Limiting checks combine rail proximity, plateaus, level, crest factor, amplitude kurtosis, and near-edge sample density. Classification confidence is a model-quality heuristic tied to the same stable estimator shown by the primary label and β, not a statistical probability.
 
 Microphones and browser audio processing are not calibrated acoustic measurement chains. Use NoiseColor for exploratory or relative spectral analysis, not sound-pressure-level measurement.
 
@@ -91,7 +91,7 @@ Run the complete verification suite:
 npm run verify
 ```
 
-The suite validates CSV parsing and measured phase summaries, condition-summary wiring, NoiseColor file upload, synthetic colored-noise recovery, quality gates, low-sample-rate behavior, state-machine hysteresis, PWA scope, repository hygiene, the production client build, the server worker fallback, and Sites packaging.
+The suite validates CSV parsing and measured phase summaries, condition-summary wiring, NoiseColor upload preflight, synthetic colored-noise recovery, tonal/limiting/model-quality gates, short-frame silence accounting, full-session aggregation, live-state transitions, history pagination, contrast/accessibility contracts, PWA scope, repository hygiene, the production client build, the server worker fallback, and Sites packaging.
 
 Local browser verification covers the `/noisecolor/` route, portrait layout, uploaded-audio analysis, scientific views, install instructions, manifest/icons, service-worker scope, offline launch, and the unchanged parent application. A final physical-device pass is still required for iPhone Safari and Android Chromium microphone permissions, installation prompts, safe-area behavior, calls/screen lock, Bluetooth route changes, and long-run thermal performance; those behaviors were not claimed as exercised in the desktop browser environment.
 

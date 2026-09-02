@@ -104,7 +104,21 @@ export async function saveMeasurement(result) {
   return record;
 }
 
-export async function listMeasurements({ limit = HISTORY_PAGE_SIZE, offset = 0 } = {}) {
+export function historyPaginationState(offset, recordCount, hasNext, pageSize = HISTORY_PAGE_SIZE) {
+  const currentOffset = Math.max(0, Math.floor(offset) || 0);
+  return {
+    offset: currentOffset,
+    pageNumber: Math.floor(currentOffset / pageSize) + 1,
+    hasPrevious: currentOffset > 0,
+    hasNext: Boolean(hasNext),
+    nextOffset: hasNext ? currentOffset + pageSize : currentOffset,
+    previousOffset: Math.max(0, currentOffset - pageSize),
+    firstRecord: recordCount ? currentOffset + 1 : 0,
+    lastRecord: currentOffset + recordCount,
+  };
+}
+
+export async function listMeasurementPage({ limit = HISTORY_PAGE_SIZE, offset = 0 } = {}) {
   const maximum = Math.max(1, Math.min(HISTORY_PAGE_SIZE, Math.floor(limit) || HISTORY_PAGE_SIZE));
   const skip = Math.max(0, Math.floor(offset) || 0);
   const database = await openDatabase();
@@ -115,8 +129,9 @@ export async function listMeasurements({ limit = HISTORY_PAGE_SIZE, offset = 0 }
       const request = database.transaction(STORE_NAME, "readonly").objectStore(STORE_NAME).index("timestamp").openCursor(null, "prev");
       request.onsuccess = () => {
         const cursor = request.result;
-        if (!cursor || records.length >= maximum) {
-          resolve(records);
+        if (!cursor || records.length > maximum) {
+          const visible = records.slice(0, maximum);
+          resolve({ records: visible, hasNext: records.length > maximum, pagination: historyPaginationState(skip, visible.length, records.length > maximum, maximum) });
           return;
         }
         if (seen >= skip) records.push(cursor.value);
@@ -128,6 +143,10 @@ export async function listMeasurements({ limit = HISTORY_PAGE_SIZE, offset = 0 }
   } finally {
     database.close();
   }
+}
+
+export async function listMeasurements(options = {}) {
+  return (await listMeasurementPage(options)).records;
 }
 
 async function deleteOperation(operation) {

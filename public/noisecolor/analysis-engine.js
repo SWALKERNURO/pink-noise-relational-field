@@ -1,5 +1,5 @@
-export const APP_VERSION = "0.6.1";
-export const ENGINE_VERSION = "0.6.1";
+export const APP_VERSION = "0.6.4";
+export const ENGINE_VERSION = "0.6.4";
 export const FFT_SIZE = 4096;
 export const WELCH_OVERLAP = 0.5;
 export const DEFAULT_FIT_RANGE = [100, 8000];
@@ -242,6 +242,27 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
   const split = Math.floor(points.length / 2);
   const low = regressPoints(xs.slice(0, split), ys.slice(0, split));
   const high = regressPoints(xs.slice(split), ys.slice(split));
+  let strongestBreakpoint = { slopeDelta: 0, frequency: null, piecewiseRmseDb: Infinity, improvementDb: 0 };
+  for (let breakpoint = 5; breakpoint <= points.length - 5; breakpoint += 1) {
+    const left = regressPoints(xs.slice(0, breakpoint), ys.slice(0, breakpoint));
+    const right = regressPoints(xs.slice(breakpoint), ys.slice(breakpoint));
+    if (!Number.isFinite(left.beta) || !Number.isFinite(right.beta)) continue;
+    const leftSquared = (left.rmseDb / 10) ** 2 * breakpoint;
+    const rightSquared = (right.rmseDb / 10) ** 2 * (points.length - breakpoint);
+    const piecewiseRmseDb = 10 * Math.sqrt((leftSquared + rightSquared) / points.length);
+    const slopeDelta = Math.abs(left.beta - right.beta);
+    const improvementDb = overall.rmseDb - piecewiseRmseDb;
+    const score = slopeDelta * Math.max(0, improvementDb);
+    const strongestScore = strongestBreakpoint.slopeDelta * Math.max(0, strongestBreakpoint.improvementDb);
+    if (score > strongestScore) {
+      strongestBreakpoint = {
+        slopeDelta,
+        frequency: 10 ** ((points[breakpoint - 1].x + points[breakpoint].x) / 2),
+        piecewiseRmseDb,
+        improvementDb,
+      };
+    }
+  }
   return {
     logBinCount: points.length,
     logBinnedBeta: overall.beta,
@@ -249,6 +270,10 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
     lowBandBeta: low.beta,
     highBandBeta: high.beta,
     segmentedSlopeDelta: Number.isFinite(low.beta) && Number.isFinite(high.beta) ? Math.abs(low.beta - high.beta) : Infinity,
+    maxBreakpointSlopeDelta: strongestBreakpoint.slopeDelta,
+    strongestBreakpointFrequency: strongestBreakpoint.frequency,
+    piecewiseRmseDb: strongestBreakpoint.piecewiseRmseDb,
+    piecewiseImprovementDb: strongestBreakpoint.improvementDb,
   };
 }
 
@@ -287,8 +312,9 @@ export function tonalityDiagnostics(frequencies, power, minFrequency, maxFrequen
 }
 
 export function calculateInputMetrics(samples) {
-  if (!samples.length) return { rms: 0, dbfs: -Infinity, peak: 0, clippingRatio: 0, nearClipRatio: 0, plateauRatio: 0, crestFactor: Infinity, limitingSuspected: false, nonFiniteRatio: 0 };
+  if (!samples.length) return { rms: 0, dbfs: -Infinity, peak: 0, clippingRatio: 0, nearClipRatio: 0, plateauRatio: 0, crestFactor: Infinity, amplitudeKurtosis: null, edgeDensityRatio: 0, limitingSuspected: false, nonFiniteRatio: 0 };
   let sumSquares = 0;
+  let sumFourth = 0;
   let peak = 0;
   let clipped = 0;
   let nearClipped = 0;
@@ -302,6 +328,7 @@ export function calculateInputMetrics(samples) {
     }
     const magnitude = Math.abs(sample);
     sumSquares += sample * sample;
+    sumFourth += sample ** 4;
     peak = Math.max(peak, magnitude);
     if (magnitude >= 0.99) clipped += 1;
     if (magnitude >= 0.98) nearClipped += 1;
@@ -314,6 +341,14 @@ export function calculateInputMetrics(samples) {
   const crestFactor = rms > 0 ? peak / rms : Infinity;
   const nearClipRatio = finiteCount ? nearClipped / finiteCount : 0;
   const plateauRatio = finiteCount ? plateauSamples / finiteCount : 0;
+  const amplitudeKurtosis = finiteCount && rms > 0 ? (sumFourth / finiteCount) / (rms ** 4) : null;
+  let edgeSamples = 0;
+  if (peak > 0) {
+    const edge = peak * 0.9;
+    for (const sample of samples) if (Number.isFinite(sample) && Math.abs(sample) >= edge) edgeSamples += 1;
+  }
+  const edgeDensityRatio = finiteCount ? edgeSamples / finiteCount : 0;
+  const smoothSaturation = dbfs > -8 && crestFactor < 1.55 && ((amplitudeKurtosis ?? Infinity) < 1.9 || edgeDensityRatio > 0.08);
   return {
     rms,
     dbfs,
@@ -322,7 +357,9 @@ export function calculateInputMetrics(samples) {
     nearClipRatio,
     plateauRatio,
     crestFactor,
-    limitingSuspected: plateauRatio > 0.002 || (dbfs > -4 && crestFactor < 1.35),
+    amplitudeKurtosis,
+    edgeDensityRatio,
+    limitingSuspected: plateauRatio > 0.002 || (dbfs > -4 && crestFactor < 1.35) || smoothSaturation,
     nonFiniteRatio: nonFinite / samples.length,
   };
 }
@@ -358,7 +395,9 @@ export function qualityGate({ durationSeconds, input, flatness, fit, tonality = 
   const narrowbandPeak = tonality.maxPeakProminenceDb >= 15 && tonality.tonalPowerRatio >= 0.06;
   const extremePeak = tonality.maxPeakProminenceDb >= 24 && tonality.tonalPowerRatio >= 0.015;
   if (flatness < 0.055 || narrowbandPeak || extremePeak) return { state: "tonal", label: "Tonal / non-noise", reliable: false, detail: "Prominent narrowband energy or harmonics do not behave like broadband colored noise." };
-  const inconsistentSlopes = modelAdequacy.segmentedSlopeDelta > 0.75 && modelAdequacy.logBinnedRmseDb > 0.85;
+  const fixedHalfMismatch = modelAdequacy.segmentedSlopeDelta > 0.75 && modelAdequacy.logBinnedRmseDb > 0.85;
+  const rollingBreakpointMismatch = modelAdequacy.maxBreakpointSlopeDelta > 0.85 && modelAdequacy.piecewiseImprovementDb > 0.32 && modelAdequacy.logBinnedRmseDb > 0.65;
+  const inconsistentSlopes = fixedHalfMismatch || rollingBreakpointMismatch;
   if (!Number.isFinite(fit.beta) || fit.beta < -2.8 || fit.beta > 2.8 || fit.rmseDb > 5.2 || inconsistentSlopes) {
     return { state: "mixed", label: "Mixed / non-power-law", reliable: false, detail: "One power-law slope does not adequately describe this spectrum." };
   }
@@ -460,6 +499,7 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     fitRange: [fitRange[0], maxFrequency],
     analysisMode: options.analysisMode || "balanced",
     analysisWindowSeconds: durationSeconds,
+    temporalSd: Number(options.temporalSd) || 0,
     beta: fit.beta,
     rawSlope: fit.slope,
     intercept: fit.intercept,
@@ -474,6 +514,8 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     nearClipRatio: input.nearClipRatio,
     plateauRatio: input.plateauRatio,
     crestFactor: input.crestFactor,
+    amplitudeKurtosis: input.amplitudeKurtosis,
+    edgeDensityRatio: input.edgeDensityRatio,
     limitingSuspected: input.limitingSuspected,
     nonFiniteRatio: input.nonFiniteRatio,
     maxPeakProminenceDb: tonality.maxPeakProminenceDb,
@@ -484,6 +526,10 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     lowBandBeta: modelAdequacy.lowBandBeta,
     highBandBeta: modelAdequacy.highBandBeta,
     segmentedSlopeDelta: modelAdequacy.segmentedSlopeDelta,
+    maxBreakpointSlopeDelta: modelAdequacy.maxBreakpointSlopeDelta,
+    strongestBreakpointFrequency: modelAdequacy.strongestBreakpointFrequency,
+    piecewiseRmseDb: modelAdequacy.piecewiseRmseDb,
+    piecewiseImprovementDb: modelAdequacy.piecewiseImprovementDb,
     classification: quality.label,
     state: quality.state,
     confidence: quality.confidence || "None",
@@ -531,10 +577,44 @@ export function buildColorTimeline(observations, durationSeconds = observations.
   return timeline;
 }
 
-export function summarizeSession(observations, durationSeconds) {
-  const durations = Object.fromEntries([...CANONICAL_COLORS.map((color) => color.key), "mixed", "tonal", "silence", "unstable", "clipping", "insufficient", "invalid"].map((key) => [key, 0]));
-  const colorTimeline = buildColorTimeline(observations, durationSeconds);
-  for (const segment of colorTimeline) durations[segment.state] = (durations[segment.state] || 0) + Math.max(0, segment.endSeconds - segment.startSeconds);
+const SESSION_STATE_KEYS = [...CANONICAL_COLORS.map((color) => color.key), "mixed", "tonal", "silence", "unstable", "clipping", "insufficient", "invalid"];
+
+function emptyStateDurations() {
+  return Object.fromEntries(SESSION_STATE_KEYS.map((key) => [key, 0]));
+}
+
+function activityState(samples, fallback = null) {
+  const input = calculateInputMetrics(samples);
+  if (input.nonFiniteRatio > 0) return { state: "invalid", label: "Invalid audio data", reliable: false };
+  if (input.dbfs < -58) return { state: "silence", label: "Signal too low", reliable: false };
+  if (input.clippingRatio > 0.001 || input.nearClipRatio > 0.01 || input.peak >= 0.9999 || input.limitingSuspected) return { state: "clipping", label: "Clipping / limiting suspected", reliable: false };
+  if (!fallback) return { state: "insufficient", label: "No stable spectral observation", reliable: false };
+  if (fallback.state === "silence") return { state: "mixed", label: "Active signal without a reliable long-window color", reliable: false };
+  const state = SESSION_STATE_KEYS.includes(fallback.state) ? fallback.state : "insufficient";
+  return { state, label: fallback.classification || fallback.label || "No stable spectral observation", reliable: Boolean(fallback.reliable) && CANONICAL_COLORS.some((color) => color.key === state) };
+}
+
+export function buildActivityTimeline(samples, sampleRate, observations = [], frameSeconds = 0.5) {
+  if (!samples.length || !Number.isFinite(sampleRate) || sampleRate <= 0) return [];
+  const frameSize = Math.max(1, Math.round(frameSeconds * sampleRate));
+  const ordered = [...observations].filter((item) => Number.isFinite(item.timeSeconds)).sort((left, right) => left.timeSeconds - right.timeSeconds);
+  const timeline = [];
+  let observationIndex = 0;
+  for (let start = 0; start < samples.length; start += frameSize) {
+    const end = Math.min(samples.length, start + frameSize);
+    const centerSeconds = (start + end) / (2 * sampleRate);
+    while (observationIndex + 1 < ordered.length && Math.abs(ordered[observationIndex + 1].timeSeconds - centerSeconds) <= Math.abs(ordered[observationIndex].timeSeconds - centerSeconds)) observationIndex += 1;
+    const classified = activityState(samples.subarray(start, end), ordered[observationIndex] || null);
+    const startSeconds = start / sampleRate;
+    const endSeconds = end / sampleRate;
+    const previous = timeline.at(-1);
+    if (previous?.state === classified.state) previous.endSeconds = endSeconds;
+    else timeline.push({ ...classified, startSeconds, endSeconds });
+  }
+  return timeline;
+}
+
+function summarizeWithDurations(observations, durationSeconds, durations, colorTimeline) {
   const total = Math.max(Number(durationSeconds) || 0, Number.EPSILON);
   const reliable = observations.filter((observation) => observation.reliable && Number.isFinite(observation.beta));
   const betaSummary = summarize(reliable.map((observation) => observation.beta));
@@ -542,9 +622,10 @@ export function summarizeSession(observations, durationSeconds) {
   const rmseSummary = summarize(reliable.map((observation) => observation.rmseDb));
   const r2Summary = summarize(reliable.map((observation) => observation.r2));
   const flatnessSummary = summarize(reliable.map((observation) => observation.spectralFlatness));
+  const reliableDuration = Object.entries(durations).filter(([state]) => CANONICAL_COLORS.some((color) => color.key === state)).reduce((sum, [, value]) => sum + value, 0);
   return {
     sessionDurationSeconds: durationSeconds,
-    dominantReliableColor: reliable.length ? dominant.label : null,
+    dominantReliableColor: reliableDuration > 0 ? dominant.label : null,
     percentages: Object.fromEntries(Object.entries(durations).map(([key, value]) => [key, (value / total) * 100])),
     betaMean: betaSummary.mean,
     betaSd: betaSummary.sd,
@@ -552,11 +633,80 @@ export function summarizeSession(observations, durationSeconds) {
     fitRmseMeanDb: rmseSummary.mean,
     fitR2Mean: r2Summary.mean,
     spectralFlatnessMean: flatnessSummary.mean,
-    reliablePercentage: Object.entries(durations).filter(([state]) => CANONICAL_COLORS.some((color) => color.key === state)).reduce((sum, [, value]) => sum + value, 0) / total * 100,
-    rejectedPercentage: Object.entries(durations).filter(([state]) => !CANONICAL_COLORS.some((color) => color.key === state)).reduce((sum, [, value]) => sum + value, 0) / total * 100,
+    reliablePercentage: reliableDuration / total * 100,
+    rejectedPercentage: (total - reliableDuration) / total * 100,
     temporalBeta: observations.map(({ timeSeconds, startSeconds, endSeconds, beta, state, classification, reliable, rmseDb, r2, spectralFlatness }) => ({ timeSeconds, startSeconds, endSeconds, beta, state, classification, reliable, rmseDb, r2, spectralFlatness })),
     colorTimeline,
   };
+}
+
+export function summarizeSession(observations, durationSeconds, activityTimeline = null) {
+  const durations = emptyStateDurations();
+  const colorTimeline = activityTimeline || buildColorTimeline(observations, durationSeconds);
+  for (const segment of colorTimeline) durations[segment.state] = (durations[segment.state] || 0) + Math.max(0, segment.endSeconds - segment.startSeconds);
+  return summarizeWithDurations(observations, durationSeconds, durations, colorTimeline);
+}
+
+export class SessionAccumulator {
+  constructor(sampleRate, frameSeconds = 0.5) {
+    this.sampleRate = sampleRate;
+    this.frameSize = Math.max(1, Math.round(sampleRate * frameSeconds));
+    this.pending = new Float32Array(this.frameSize);
+    this.pendingLength = 0;
+    this.durations = emptyStateDurations();
+    this.durationSeconds = 0;
+    this.observations = { count: 0, betaMean: 0, betaM2: 0, rmseSum: 0, r2Sum: 0, flatnessSum: 0 };
+  }
+
+  addAudio(samples, fallback = null) {
+    let offset = 0;
+    while (offset < samples.length) {
+      const count = Math.min(samples.length - offset, this.frameSize - this.pendingLength);
+      this.pending.set(samples.subarray(offset, offset + count), this.pendingLength);
+      this.pendingLength += count;
+      offset += count;
+      if (this.pendingLength === this.frameSize) this.commitFrame(this.pending, this.frameSize / this.sampleRate, fallback);
+    }
+  }
+
+  commitFrame(samples, durationSeconds, fallback) {
+    const classified = activityState(samples, fallback);
+    this.durations[classified.state] = (this.durations[classified.state] || 0) + durationSeconds;
+    this.durationSeconds += durationSeconds;
+    this.pendingLength = 0;
+  }
+
+  addObservation(observation) {
+    if (!observation?.reliable || !Number.isFinite(observation.beta)) return;
+    const stats = this.observations;
+    stats.count += 1;
+    const delta = observation.beta - stats.betaMean;
+    stats.betaMean += delta / stats.count;
+    stats.betaM2 += delta * (observation.beta - stats.betaMean);
+    if (Number.isFinite(observation.rmseDb)) stats.rmseSum += observation.rmseDb;
+    if (Number.isFinite(observation.r2)) stats.r2Sum += observation.r2;
+    if (Number.isFinite(observation.spectralFlatness)) stats.flatnessSum += observation.spectralFlatness;
+  }
+
+  finish(fallback = null) {
+    if (this.pendingLength) this.commitFrame(this.pending.subarray(0, this.pendingLength), this.pendingLength / this.sampleRate, fallback);
+  }
+
+  summary(visualObservations = [], visualTimeline = []) {
+    const summary = summarizeWithDurations(visualObservations, this.durationSeconds, { ...this.durations }, visualTimeline);
+    const stats = this.observations;
+    if (stats.count) {
+      summary.betaMean = stats.betaMean;
+      summary.betaSd = Math.sqrt(stats.betaM2 / stats.count);
+      summary.betaMedian = null;
+      summary.fitRmseMeanDb = stats.rmseSum / stats.count;
+      summary.fitR2Mean = stats.r2Sum / stats.count;
+      summary.spectralFlatnessMean = stats.flatnessSum / stats.count;
+    }
+    summary.aggregateObservationCount = stats.count;
+    summary.statisticsCoverFullSession = true;
+    return summary;
+  }
 }
 
 export function analyzeRecording(samples, sampleRate, options = {}) {
@@ -590,10 +740,11 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
     flatness: overall.spectralFlatness,
     fit: { beta: overall.beta, rmseDb: overall.rmseDb },
     tonality: { maxPeakProminenceDb: overall.maxPeakProminenceDb, tonalPowerRatio: overall.tonalPowerRatio },
-    modelAdequacy: { segmentedSlopeDelta: overall.segmentedSlopeDelta, logBinnedRmseDb: overall.logBinnedRmseDb },
+    modelAdequacy: { segmentedSlopeDelta: overall.segmentedSlopeDelta, logBinnedRmseDb: overall.logBinnedRmseDb, maxBreakpointSlopeDelta: overall.maxBreakpointSlopeDelta, piecewiseImprovementDb: overall.piecewiseImprovementDb },
     temporalSd: reliableSummary.sd || 0,
   });
-  const sessionSummary = summarizeSession(observations, overall.durationSeconds);
+  const activityTimeline = buildActivityTimeline(samples, sampleRate, observations, options.activityFrameSeconds || 0.5);
+  const sessionSummary = summarizeSession(observations, overall.durationSeconds, activityTimeline);
   if (Number.isFinite(reliableSummary.sd) && reliableSummary.sd > 0.55) {
     gated = { state: "unstable", label: "Spectrally unstable", reliable: false, detail: "The estimated slope changes too much over time for one stable color label." };
   } else if (gated.reliable && sessionSummary.rejectedPercentage >= 20) {
@@ -613,7 +764,7 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
     temporalBetaSd: reliableSummary.sd,
     temporalBetaMedian: reliableSummary.median,
     temporalBeta: observations,
-    colorTimeline: buildColorTimeline(observations, overall.durationSeconds),
+    colorTimeline: activityTimeline,
     sessionSummary,
   };
 }

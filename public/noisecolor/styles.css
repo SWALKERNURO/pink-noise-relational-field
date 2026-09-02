@@ -8,8 +8,8 @@
   --line: #223047;
   --line-soft: #162235;
   --text: #f8fafc;
-  --muted: #8b98aa;
-  --dim: #5d6a7d;
+  --muted: #aab5c5;
+  --dim: #98a5b8;
   --accent: #c6ff5c;
   --accent-ink: #101807;
   --violet: #a78bfa;
@@ -136,6 +136,10 @@ canvas { display: block; width: 100%; height: auto; margin-top: 14px; background
 .history-item .history-beta { font: 500 18px ui-monospace, monospace; }
 .history-actions { display: flex; flex-wrap: wrap; gap: 7px; }
 .history-actions button { min-height: 40px; border: 1px solid var(--line); background: var(--surface-2); border-radius: 6px; padding: 0 11px; font-size: 11px; cursor: pointer; }
+.history-pagination { margin-top: 16px; display: grid; grid-template-columns: minmax(88px, 1fr) auto minmax(88px, 1fr); align-items: center; gap: 10px; }
+.history-pagination button { min-height: 44px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface-2); color: var(--text); font-size: 11px; font-weight: 700; cursor: pointer; }
+.history-pagination button:disabled { cursor: default; color: var(--dim); }
+.history-pagination span { color: var(--muted); font-size: 11px; text-align: center; }
 .empty-state { color: var(--muted); border: 1px dashed var(--line); padding: 30px; text-align: center; }
 .advanced-tabs, .spectrum-toggle { display: flex; overflow-x: auto; margin-top: 22px; border-bottom: 1px solid var(--line); }
 .advanced-tabs, .spectrum-toggle { scrollbar-width: none; }

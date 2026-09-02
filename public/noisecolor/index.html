@@ -14,7 +14,7 @@
   <link rel="manifest" href="./manifest.webmanifest" />
   <link rel="apple-touch-icon" href="./icons/apple-touch-icon.png" />
   <link rel="icon" href="./icons/icon-192.png" />
-  <link rel="stylesheet" href="./styles.css?v=0.6.1" />
+  <link rel="stylesheet" href="./styles.css?v=0.6.4" />
   <title>NoiseColor — Live spectral structure</title>
 </head>
 <body>
@@ -128,7 +128,7 @@
           <label id="fileDrop" class="file-drop">
             <input id="audioFile" type="file" accept="audio/*,.wav,.mp3,.m4a,.aac,.ogg,.flac" />
             <strong>Choose or drop audio</strong>
-            <span id="fileName">WAV, MP3, M4A, AAC, OGG, or FLAC · maximum 40 MB</span>
+            <span id="fileName">PCM WAV up to 40 MB · verified compressed audio up to 12 MB / 2 min</span>
           </label>
           <div id="uploadStatus" class="inline-status" role="status">Ready for a local audio file.</div>
           <div id="uploadResult" class="result-panel" hidden></div>
@@ -141,6 +141,11 @@
           </div>
           <p class="view-lede">History stores measurement results and metadata in this browser. Raw audio is not included.</p>
           <div id="historyList" class="history-list"><p class="empty-state">No saved measurements yet.</p></div>
+          <nav class="history-pagination" aria-label="Saved measurement pages">
+            <button id="historyPrevious" type="button" disabled>Previous</button>
+            <span id="historyPageStatus" role="status" aria-live="polite">Page 1</span>
+            <button id="historyNext" type="button" disabled>Next</button>
+          </nav>
         </section>
 
         <section id="advancedView" class="view" data-view-panel="advanced" aria-labelledby="advancedTitle" hidden>
@@ -177,7 +182,7 @@
               <div class="calibration-copy">
                 <h2>Frequency-response correction</h2>
                 <p>Scalar gain shifts the spectrum vertically and does not materially change β. A frequency-dependent microphone response can change β, so correction profiles are optional, named, and input-route specific.</p>
-                <strong id="calibrationState">Uncorrected</strong>
+                <strong id="calibrationState" role="status" aria-live="polite" aria-atomic="true">Uncorrected</strong>
               </div>
               <label class="file-drop compact">
                 <input id="calibrationFile" type="file" accept="application/json,.json" />
@@ -200,7 +205,7 @@
         <section><span class="rail-number">01</span><h2>Measured</h2><div id="railMeasured">No live measurement yet.</div></section>
         <section><span class="rail-number">02</span><h2>Interpretation</h2><p id="railInterpretation">A canonical color appears only after the stable estimator passes silence, clipping, tonal, stability, and fit-quality gates.</p></section>
         <section><span class="rail-number dim">03</span><h2>Question</h2><p>Is the current sound genuinely broadband and scale-like, or is one β hiding tones and change over time?</p></section>
-        <footer><strong>PRIVATE BY DESIGN</strong><p>Audio is analyzed locally and is not uploaded to a server.</p><small id="versionLabel">NoiseColor v0.6.1</small></footer>
+        <footer><strong>PRIVATE BY DESIGN</strong><p>Audio is analyzed locally and is not uploaded to a server.</p><small id="versionLabel">NoiseColor v0.6.4</small></footer>
       </aside>
     </main>
 
@@ -220,6 +225,6 @@
   </div>
 
   <noscript>NoiseColor requires JavaScript for local audio analysis.</noscript>
-  <script type="module" src="./app.js?v=0.6.1"></script>
+  <script type="module" src="./app.js?v=0.6.4"></script>
 </body>
 </html>
