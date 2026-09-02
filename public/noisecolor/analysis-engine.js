@@ -1,5 +1,5 @@
-export const APP_VERSION = "0.6.6";
-export const ENGINE_VERSION = "0.6.6";
+export const APP_VERSION = "0.6.8";
+export const ENGINE_VERSION = "0.6.8";
 export const FFT_SIZE = 4096;
 export const WELCH_OVERLAP = 0.5;
 export const DEFAULT_FIT_RANGE = [100, 8000];
@@ -244,6 +244,64 @@ function hingeRegressPoints(xs, ys, breakpointX) {
   };
 }
 
+function solveLinearSystem(matrix, vector) {
+  const size = vector.length;
+  const augmented = matrix.map((row, index) => [...row, vector[index]]);
+  for (let column = 0; column < size; column += 1) {
+    let pivot = column;
+    for (let row = column + 1; row < size; row += 1) {
+      if (Math.abs(augmented[row][column]) > Math.abs(augmented[pivot][column])) pivot = row;
+    }
+    if (Math.abs(augmented[pivot][column]) <= 1e-12) return null;
+    [augmented[column], augmented[pivot]] = [augmented[pivot], augmented[column]];
+    const divisor = augmented[column][column];
+    for (let item = column; item <= size; item += 1) augmented[column][item] /= divisor;
+    for (let row = 0; row < size; row += 1) {
+      if (row === column) continue;
+      const factor = augmented[row][column];
+      for (let item = column; item <= size; item += 1) augmented[row][item] -= factor * augmented[column][item];
+    }
+  }
+  return augmented.map((row) => row[size]);
+}
+
+function robustBasisRegression(rows, ys, iterations = 5) {
+  if (!rows.length || rows.length < rows[0].length + 2 || rows.length !== ys.length) return null;
+  const coefficientCount = rows[0].length;
+  let weights = new Float64Array(rows.length).fill(1);
+  let coefficients = null;
+  for (let iteration = 0; iteration < iterations; iteration += 1) {
+    const matrix = Array.from({ length: coefficientCount }, () => new Array(coefficientCount).fill(0));
+    const vector = new Array(coefficientCount).fill(0);
+    for (let row = 0; row < rows.length; row += 1) {
+      for (let left = 0; left < coefficientCount; left += 1) {
+        vector[left] += weights[row] * rows[row][left] * ys[row];
+        for (let right = 0; right < coefficientCount; right += 1) matrix[left][right] += weights[row] * rows[row][left] * rows[row][right];
+      }
+    }
+    coefficients = solveLinearSystem(matrix, vector);
+    if (!coefficients) return null;
+    const residuals = ys.map((value, index) => value - rows[index].reduce((sum, basis, item) => sum + basis * coefficients[item], 0));
+    const center = median(residuals);
+    const scale = 1.4826 * median(residuals.map((value) => Math.abs(value - center)));
+    if (!(scale > 1e-9)) break;
+    const cutoff = 1.5 * scale;
+    weights = Float64Array.from(residuals, (value) => Math.min(1, cutoff / Math.max(Math.abs(value - center), Number.EPSILON)));
+  }
+  const predictions = rows.map((row) => row.reduce((sum, basis, index) => sum + basis * coefficients[index], 0));
+  const residuals = ys.map((value, index) => value - predictions[index]);
+  const squaredError = residuals.reduce((sum, value) => sum + value * value, 0);
+  const residualCenter = median(residuals);
+  return {
+    coefficients,
+    predictions,
+    residuals,
+    squaredError,
+    rmseDb: 10 * Math.sqrt(squaredError / residuals.length),
+    residualMadDb: 10 * 1.4826 * median(residuals.map((value) => Math.abs(value - residualCenter))),
+  };
+}
+
 export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFrequency, binCount = 48) {
   const logMin = Math.log10(minFrequency);
   const logMax = Math.log10(maxFrequency);
@@ -264,6 +322,20 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
   const ys = points.map((point) => point.y);
   const overall = regressPoints(xs, ys);
   const overallSquaredError = Number.isFinite(overall.rmseDb) ? (overall.rmseDb / 10) ** 2 * points.length : Infinity;
+  // This robust smooth model is diagnostic only. The canonical beta above still
+  // comes from the unchanged continuous-PSD fitPowerLaw estimator.
+  const centerX = xs.reduce((sum, value) => sum + value, 0) / Math.max(xs.length, 1);
+  const smoothRows = xs.map((x) => {
+    const centered = x - centerX;
+    return [1, centered, centered ** 2, centered ** 3, centered ** 4, centered ** 5];
+  });
+  const smoothFit = robustBasisRegression(smoothRows, ys);
+  const smoothLinear = smoothFit ? regressPoints(xs, smoothFit.predictions) : null;
+  const smoothDeviationsDb = smoothFit && smoothLinear
+    ? smoothFit.predictions.map((value, index) => 10 * (value - (smoothLinear.intercept + smoothLinear.slope * xs[index])))
+    : [];
+  const smoothCurvatureMagnitudeDb = smoothDeviationsDb.length ? Math.max(...smoothDeviationsDb) - Math.min(...smoothDeviationsDb) : Infinity;
+  const smoothCurvatureRmseDb = smoothDeviationsDb.length ? Math.sqrt(smoothDeviationsDb.reduce((sum, value) => sum + value * value, 0) / smoothDeviationsDb.length) : Infinity;
   const split = Math.floor(points.length / 2);
   const low = regressPoints(xs.slice(0, split), ys.slice(0, split));
   const high = regressPoints(xs.slice(split), ys.slice(split));
@@ -290,6 +362,27 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
       };
     }
   }
+  let strongestAbruptBreakpoint = { slopeDelta: 0, frequency: null, rmseDb: Infinity, improvementDb: 0, relativeImprovement: 0, evidence: 0, supportBins: 0 };
+  if (smoothFit) {
+    // Re-test each hinge after accounting for broad, continuous coloration.
+    for (let breakpoint = 7; breakpoint <= points.length - 2; breakpoint += 1) {
+      const breakpointX = (points[breakpoint - 1].x + points[breakpoint].x) / 2;
+      const rows = xs.map((x) => {
+        const centered = x - centerX;
+        return [1, centered, centered ** 2, centered ** 3, centered ** 4, centered ** 5, Math.max(0, x - breakpointX)];
+      });
+      const adjusted = robustBasisRegression(rows, ys);
+      if (!adjusted) continue;
+      const improvementDb = smoothFit.rmseDb - adjusted.rmseDb;
+      const relativeImprovement = smoothFit.squaredError > 0 ? Math.max(0, 1 - adjusted.squaredError / smoothFit.squaredError) : 0;
+      const slopeDelta = Math.abs(adjusted.coefficients.at(-1));
+      const supportBins = Math.min(breakpoint, points.length - breakpoint);
+      const evidence = slopeDelta * relativeImprovement * Math.sqrt(supportBins);
+      if (evidence > strongestAbruptBreakpoint.evidence) {
+        strongestAbruptBreakpoint = { slopeDelta, frequency: 10 ** breakpointX, rmseDb: adjusted.rmseDb, improvementDb, relativeImprovement, evidence, supportBins };
+      }
+    }
+  }
   return {
     logBinCount: points.length,
     logBinnedBeta: overall.beta,
@@ -304,40 +397,120 @@ export function modelAdequacyDiagnostics(frequencies, power, minFrequency, maxFr
     piecewiseRelativeImprovement: strongestBreakpoint.relativeImprovement,
     breakpointEvidence: strongestBreakpoint.evidence,
     breakpointSupportBins: strongestBreakpoint.supportBins,
+    smoothCurvatureMagnitudeDb,
+    smoothCurvatureRmseDb,
+    smoothResidualRmseDb: smoothFit?.rmseDb ?? Infinity,
+    smoothResidualMadDb: smoothFit?.residualMadDb ?? Infinity,
+    abruptBreakpointSlopeDelta: strongestAbruptBreakpoint.slopeDelta,
+    abruptBreakpointFrequency: strongestAbruptBreakpoint.frequency,
+    abruptBreakpointRmseDb: strongestAbruptBreakpoint.rmseDb,
+    abruptBreakpointImprovementDb: strongestAbruptBreakpoint.improvementDb,
+    abruptBreakpointRelativeImprovement: strongestAbruptBreakpoint.relativeImprovement,
+    abruptBreakpointEvidence: strongestAbruptBreakpoint.evidence,
+    abruptBreakpointSupportBins: strongestAbruptBreakpoint.supportBins,
   };
 }
 
-export function tonalityDiagnostics(frequencies, power, minFrequency, maxFrequency) {
+export function tonalityDiagnostics(frequencies, power, minFrequency, maxFrequency, fit = null, previousPeakFrequencies = []) {
   const indices = [];
   for (let index = 1; index < frequencies.length; index += 1) {
     if (frequencies[index] >= minFrequency && frequencies[index] <= maxFrequency && power[index] > 0 && Number.isFinite(power[index])) indices.push(index);
   }
-  if (indices.length < 16) return { maxPeakProminenceDb: 0, tonalPowerRatio: 0, prominentPeakCount: 0 };
-  let totalPower = 0;
+  if (indices.length < 16) return { slopeNormalizedFlatness: 0, maxPeakProminenceDb: 0, tonalPowerRatio: 0, prominentPeakCount: 0, persistentPeakCount: 0, harmonicPeakCount: 0, harmonicEvidence: 0, broadbandOccupancy: 0, prominentPeakFrequencies: [] };
+  const residual = new Float64Array(power.length);
+  let residualLogSum = 0;
+  let residualSum = 0;
+  for (const index of indices) {
+    const frequency = frequencies[index];
+    const predicted = Number.isFinite(fit?.intercept) && Number.isFinite(fit?.slope)
+      ? 10 ** (fit.intercept + fit.slope * Math.log10(frequency))
+      : 1;
+    residual[index] = Math.max(power[index] / Math.max(predicted, Number.MIN_VALUE), Number.MIN_VALUE);
+    residualLogSum += Math.log(residual[index]);
+    residualSum += residual[index];
+  }
+  const slopeNormalizedFlatness = Math.exp(residualLogSum / indices.length) / (residualSum / indices.length);
   let tonalExcess = 0;
   let maxPeakProminenceDb = 0;
-  let prominentPeakCount = 0;
   const first = indices[0];
   const last = indices.at(-1);
+  const candidates = [];
   for (const index of indices) {
-    const value = power[index];
-    totalPower += value;
+    const value = residual[index];
+    let localMaximum = true;
+    for (let neighbor = Math.max(first, index - 2); neighbor <= Math.min(last, index + 2); neighbor += 1) {
+      if (neighbor !== index && residual[neighbor] >= value) { localMaximum = false; break; }
+    }
+    if (!localMaximum) continue;
     const neighborhood = [];
-    for (let neighbor = Math.max(first, index - 12); neighbor <= Math.min(last, index + 12); neighbor += 1) {
-      if (Math.abs(neighbor - index) <= 2) continue;
-      neighborhood.push(power[neighbor]);
+    for (let neighbor = Math.max(first, index - 18); neighbor <= Math.min(last, index + 18); neighbor += 1) {
+      if (Math.abs(neighbor - index) <= 3) continue;
+      neighborhood.push(residual[neighbor]);
     }
     const localFloor = median(neighborhood.filter((item) => item > 0 && Number.isFinite(item)));
     if (!(localFloor > 0)) continue;
     const prominenceDb = 10 * Math.log10(value / localFloor);
     maxPeakProminenceDb = Math.max(maxPeakProminenceDb, prominenceDb);
-    if (prominenceDb >= 12) prominentPeakCount += 1;
-    if (prominenceDb >= 8) tonalExcess += Math.max(0, value - localFloor * 10 ** (8 / 10));
+    if (prominenceDb >= 10) candidates.push({ index, frequency: frequencies[index], prominenceDb, localFloor });
   }
+
+  const peaks = [];
+  for (const candidate of candidates.sort((left, right) => right.prominenceDb - left.prominenceDb)) {
+    if (peaks.some((peak) => Math.abs(peak.index - candidate.index) <= 10)) continue;
+    peaks.push(candidate);
+  }
+  peaks.sort((left, right) => left.frequency - right.frequency);
+  for (const peak of peaks) {
+    const threshold = peak.localFloor * 10 ** (8 / 10);
+    let peakExcess = 0;
+    for (let index = Math.max(first, peak.index - 2); index <= Math.min(last, peak.index + 2); index += 1) {
+      peakExcess += Math.max(0, residual[index] - threshold);
+    }
+    peak.excessPower = peakExcess;
+    tonalExcess += peakExcess;
+  }
+
+  const logMin = Math.log10(minFrequency);
+  const logMax = Math.log10(maxFrequency);
+  const bands = Array.from({ length: 24 }, () => []);
+  for (const index of indices) {
+    const band = Math.min(bands.length - 1, Math.floor(((Math.log10(frequencies[index]) - logMin) / (logMax - logMin)) * bands.length));
+    bands[band].push(residual[index]);
+  }
+  const bandLevels = bands.filter((values) => values.length).map((values) => median(values));
+  const maximumBandLevel = Math.max(...bandLevels);
+  const broadbandOccupancy = maximumBandLevel > 0 ? bandLevels.filter((value) => value >= maximumBandLevel / 100).length / bandLevels.length : 0;
+  const prominentPeaks = peaks.filter((peak) => peak.prominenceDb >= 15 && peak.excessPower / residualSum >= 0.001);
+  const prominentPeakCount = prominentPeaks.length;
+  let harmonicPeakCount = 0;
+  for (const seedPeak of prominentPeaks) {
+    for (let divisor = 1; divisor <= 12; divisor += 1) {
+      const fundamentalFrequency = seedPeak.frequency / divisor;
+      if (fundamentalFrequency < 40) continue;
+      let matched = 0;
+      for (const candidate of prominentPeaks) {
+        const harmonic = Math.round(candidate.frequency / fundamentalFrequency);
+        if (harmonic < 1 || harmonic > 12) continue;
+        const tolerance = Math.max(0.018, (2 * (frequencies[1] - frequencies[0])) / candidate.frequency);
+        if (Math.abs(candidate.frequency / fundamentalFrequency - harmonic) / harmonic <= tolerance) matched += 1;
+      }
+      harmonicPeakCount = Math.max(harmonicPeakCount, matched);
+    }
+  }
+  const persistentPeakCount = prominentPeaks.filter((peak) => previousPeakFrequencies.some((frequency) => {
+    const toleranceHz = Math.max(12, frequency * 0.02);
+    return Math.abs(peak.frequency - frequency) <= toleranceHz;
+  })).length;
   return {
+    slopeNormalizedFlatness,
     maxPeakProminenceDb,
-    tonalPowerRatio: totalPower > 0 ? tonalExcess / totalPower : 0,
+    tonalPowerRatio: residualSum > 0 ? Math.min(1, tonalExcess / residualSum) : 0,
     prominentPeakCount,
+    persistentPeakCount,
+    harmonicPeakCount,
+    harmonicEvidence: prominentPeakCount ? Math.min(1, harmonicPeakCount / prominentPeakCount) : 0,
+    broadbandOccupancy,
+    prominentPeakFrequencies: prominentPeaks.map((peak) => peak.frequency),
   };
 }
 
@@ -416,30 +589,79 @@ export function nearestCanonical(beta) {
   ), CANONICAL_COLORS[0]);
 }
 
+function assessModelAdequacy(fit, tonality, modelAdequacy, temporalSd) {
+  const smoothMagnitude = Number(modelAdequacy.smoothCurvatureMagnitudeDb);
+  const smoothResidual = Number(modelAdequacy.smoothResidualRmseDb);
+  const smoothResidualMad = Number(modelAdequacy.smoothResidualMadDb);
+  const abruptDelta = Number(modelAdequacy.abruptBreakpointSlopeDelta);
+  const abruptImprovement = Number(modelAdequacy.abruptBreakpointImprovementDb);
+  const abruptRelativeImprovement = Number(modelAdequacy.abruptBreakpointRelativeImprovement);
+  const abruptEvidence = Number(modelAdequacy.abruptBreakpointEvidence);
+  const normalizedFlatness = Number(tonality.slopeNormalizedFlatness);
+  const occupancy = Number(tonality.broadbandOccupancy);
+  const acousticColoration = fit.rmseDb > 2.2 || smoothMagnitude > 6;
+  const strongAbruptBreakpoint = abruptDelta >= 0.6
+    && abruptImprovement >= 0.04
+    && abruptRelativeImprovement >= 0.35
+    && abruptEvidence >= 0.8;
+  const subtleAbruptBreakpoint = smoothMagnitude <= 5.5
+    && modelAdequacy.maxBreakpointSlopeDelta >= 0.55
+    && modelAdequacy.piecewiseImprovementDb >= 0.012
+    && modelAdequacy.piecewiseRelativeImprovement >= 0.18
+    && modelAdequacy.breakpointEvidence >= 0.2
+    && abruptDelta >= 0.35;
+  const extremeSmoothCurvature = smoothMagnitude > 22;
+  const irregularResidual = smoothResidual > 1.5 && smoothResidualMad > 1.1 && fit.rmseDb > 3.8;
+  const inadequateBroadbandSupport = acousticColoration && (normalizedFlatness < 0.18 || occupancy < 0.65);
+  const failures = [
+    (!Number.isFinite(fit.beta) || fit.beta < -2.8 || fit.beta > 2.8) && "slope outside the supported range",
+    fit.rmseDb > 5.8 && "excessive continuous-PSD residual",
+    (strongAbruptBreakpoint || subtleAbruptBreakpoint) && "abrupt breakpoint evidence",
+    extremeSmoothCurvature && "extreme smooth curvature",
+    irregularResidual && "irregular residual after smooth-trend removal",
+    inadequateBroadbandSupport && "insufficient broadband support for acoustic-coloration tolerance",
+  ].filter(Boolean);
+  const breakpointFrequency = Number.isFinite(modelAdequacy.abruptBreakpointFrequency) ? `${Math.round(modelAdequacy.abruptBreakpointFrequency)} Hz` : "none";
+  const metrics = `smooth curvature ${Number.isFinite(smoothMagnitude) ? smoothMagnitude.toFixed(1) : "—"} dB, smooth residual ${Number.isFinite(smoothResidual) ? smoothResidual.toFixed(2) : "—"} dB, abrupt Δβ ${Number.isFinite(abruptDelta) ? abruptDelta.toFixed(2) : "—"} at ${breakpointFrequency}, abrupt improvement ${Number.isFinite(abruptImprovement) ? abruptImprovement.toFixed(2) : "—"} dB, occupancy ${Number.isFinite(occupancy) ? `${(occupancy * 100).toFixed(0)}%` : "—"}, temporal SD ${Number.isFinite(temporalSd) ? temporalSd.toFixed(2) : "—"}`;
+  if (failures.length) return { passed: false, status: "failed", acousticColoration, detail: `Model adequacy failed: ${failures.join(", ")} (${metrics}).` };
+  const status = acousticColoration ? "smooth-acoustic-coloration" : "power-law";
+  const interpretation = acousticColoration ? "smooth acoustic coloration accepted" : "single power-law adequate";
+  return { passed: true, status, acousticColoration, detail: `Model adequacy passed: ${interpretation} (${metrics}).` };
+}
+
 export function qualityGate({ durationSeconds, input, flatness, fit, tonality = {}, modelAdequacy = {}, temporalSd = 0 }) {
   if (!Number.isFinite(durationSeconds) || durationSeconds < 0) return { state: "invalid", label: "Invalid audio data", reliable: false, detail: "The sample rate or signal duration is invalid." };
   if (input.nonFiniteRatio > 0 || !Number.isFinite(input.rms)) return { state: "invalid", label: "Invalid audio data", reliable: false, detail: "The decoded signal contains non-finite samples and cannot be analyzed reliably." };
   if (durationSeconds < 1.5) return { state: "insufficient", label: "Keep listening…", reliable: false, detail: "More audio is needed for a stable estimate." };
   if (input.dbfs < -58) return { state: "silence", label: "Signal too low", reliable: false, detail: "Raise the signal level or move closer to the source." };
   if (input.clippingRatio > 0.001 || input.nearClipRatio > 0.01 || input.peak >= 0.9999 || input.limitingSuspected) return { state: "clipping", label: "Clipping / limiting suspected", reliable: false, detail: "The waveform appears clipped or aggressively limited; move farther away or reduce gain if possible." };
-  const narrowbandPeak = tonality.maxPeakProminenceDb >= 15 && tonality.tonalPowerRatio >= 0.06;
-  const extremePeak = tonality.maxPeakProminenceDb >= 24 && tonality.tonalPowerRatio >= 0.015;
-  if (flatness < 0.055 || narrowbandPeak || extremePeak) return { state: "tonal", label: "Tonal / non-noise", reliable: false, detail: "Prominent narrowband energy or harmonics do not behave like broadband colored noise." };
-  const fixedHalfMismatch = modelAdequacy.segmentedSlopeDelta > 0.75 && modelAdequacy.logBinnedRmseDb > 0.85;
-  const rollingBreakpointMismatch = modelAdequacy.maxBreakpointSlopeDelta >= 0.55
-    && modelAdequacy.piecewiseImprovementDb >= 0.012
-    && modelAdequacy.piecewiseRelativeImprovement >= 0.18
-    && modelAdequacy.breakpointEvidence >= 0.2;
-  const inconsistentSlopes = fixedHalfMismatch || rollingBreakpointMismatch;
-  if (!Number.isFinite(fit.beta) || fit.beta < -2.8 || fit.beta > 2.8 || fit.rmseDb > 5.2 || inconsistentSlopes) {
-    return { state: "mixed", label: "Mixed / non-power-law", reliable: false, detail: "One power-law slope does not adequately describe this spectrum." };
+  const normalizedFlatness = Number.isFinite(tonality.slopeNormalizedFlatness) ? tonality.slopeNormalizedFlatness : flatness;
+  const concentratedPeak = tonality.maxPeakProminenceDb >= 18 && tonality.tonalPowerRatio >= 0.3 && normalizedFlatness < 0.72;
+  const dominantPeak = tonality.maxPeakProminenceDb >= 22 && tonality.tonalPowerRatio >= 0.15 && normalizedFlatness < 0.9;
+  const extremePeak = tonality.maxPeakProminenceDb >= 30 && tonality.tonalPowerRatio >= 0.025;
+  const harmonicStructure = tonality.harmonicPeakCount >= 3 && tonality.harmonicEvidence >= 0.55 && tonality.tonalPowerRatio >= 0.02;
+  const multipleNarrowPeaks = tonality.prominentPeakCount >= 4 && tonality.tonalPowerRatio >= 0.06 && normalizedFlatness < 0.72;
+  const noBroadbandBackground = normalizedFlatness < 0.08 && tonality.broadbandOccupancy < 0.55;
+  const tonalReasons = [
+    concentratedPeak && "concentrated narrow peak",
+    dominantPeak && "dominant narrow peak",
+    extremePeak && "extreme peak prominence",
+    harmonicStructure && "harmonic spacing",
+    multipleNarrowPeaks && "multiple narrow peaks",
+    noBroadbandBackground && "insufficient broadband background",
+  ].filter(Boolean);
+  if (tonalReasons.length) {
+    const evidence = `normalized flatness ${normalizedFlatness.toFixed(3)}, peak ${Number(tonality.maxPeakProminenceDb || 0).toFixed(1)} dB, tonal power ${(100 * Number(tonality.tonalPowerRatio || 0)).toFixed(1)}%, peaks ${tonality.prominentPeakCount || 0}, persistent ${tonality.persistentPeakCount || 0}, harmonic matches ${tonality.harmonicPeakCount || 0}`;
+    return { state: "tonal", label: "Tonal / non-noise", reliable: false, detail: `Tonal evidence: ${tonalReasons.join(", ")} (${evidence}).` };
   }
-  if (temporalSd > 0.55) return { state: "unstable", label: "Spectrally unstable", reliable: false, detail: "The estimated slope is changing too much for one stable color label." };
+  const adequacy = assessModelAdequacy(fit, tonality, modelAdequacy, temporalSd);
+  if (!adequacy.passed) return { state: "mixed", label: "Mixed / non-power-law", reliable: false, detail: adequacy.detail, modelAdequacyStatus: adequacy.status, modelAdequacyDetail: adequacy.detail };
+  if (temporalSd > 0.55) return { state: "unstable", label: "Spectrally unstable", reliable: false, detail: "The estimated slope is changing too much for one stable color label.", modelAdequacyStatus: adequacy.status, modelAdequacyDetail: adequacy.detail };
   const canonical = nearestCanonical(fit.beta);
   const distance = Math.abs(fit.beta - canonical.beta);
   let confidence = "Low";
-  if (fit.rmseDb <= 2.2 && distance <= 0.3 && temporalSd <= 0.16) confidence = "High";
-  else if (fit.rmseDb <= 3.8 && distance <= 0.55 && temporalSd <= 0.35) confidence = "Moderate";
+  if (!adequacy.acousticColoration && fit.rmseDb <= 2.2 && distance <= 0.3 && temporalSd <= 0.16) confidence = "High";
+  else if (fit.rmseDb <= 4.6 && distance <= 0.55 && temporalSd <= 0.35) confidence = "Moderate";
   return {
     state: canonical.key,
     label: canonical.label,
@@ -447,7 +669,9 @@ export function qualityGate({ durationSeconds, input, flatness, fit, tonality = 
     distance,
     confidence,
     reliable: true,
-    detail: `Nearest canonical slope β = ${canonical.beta}; distance ${distance.toFixed(2)} β.`,
+    detail: `Measured β = ${fit.beta.toFixed(2)}; nearest canonical target β = ${canonical.beta.toFixed(2)}; distance ${distance.toFixed(2)} β. ${adequacy.detail}`,
+    modelAdequacyStatus: adequacy.status,
+    modelAdequacyDetail: adequacy.detail,
   };
 }
 
@@ -510,7 +734,7 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
   const fit = fitPowerLaw(psd.frequencies, psd.power, fitRange[0], maxFrequency);
   const input = calculateInputMetrics(samples);
   const flatness = spectralFlatness(psd.frequencies, psd.power, fitRange[0], maxFrequency);
-  const tonality = tonalityDiagnostics(psd.frequencies, psd.power, fitRange[0], maxFrequency);
+  const tonality = tonalityDiagnostics(psd.frequencies, psd.power, fitRange[0], maxFrequency, fit, options.previousProminentPeakFrequencies || []);
   const modelAdequacy = modelAdequacyDiagnostics(psd.frequencies, psd.power, fitRange[0], maxFrequency);
   const durationSeconds = samples.length / sampleRate;
   const quality = qualityGate({ durationSeconds, input, flatness, fit, tonality, modelAdequacy, temporalSd: options.temporalSd || 0 });
@@ -540,6 +764,7 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     rmseDb: fit.rmseDb,
     maeDb: fit.maeDb,
     spectralFlatness: flatness,
+    slopeNormalizedFlatness: tonality.slopeNormalizedFlatness,
     rms: input.rms,
     dbfs: input.dbfs,
     peak: input.peak,
@@ -554,6 +779,11 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     maxPeakProminenceDb: tonality.maxPeakProminenceDb,
     tonalPowerRatio: tonality.tonalPowerRatio,
     prominentPeakCount: tonality.prominentPeakCount,
+    persistentPeakCount: tonality.persistentPeakCount,
+    harmonicPeakCount: tonality.harmonicPeakCount,
+    harmonicEvidence: tonality.harmonicEvidence,
+    broadbandOccupancy: tonality.broadbandOccupancy,
+    prominentPeakFrequencies: tonality.prominentPeakFrequencies,
     logBinnedBeta: modelAdequacy.logBinnedBeta,
     logBinnedRmseDb: modelAdequacy.logBinnedRmseDb,
     lowBandBeta: modelAdequacy.lowBandBeta,
@@ -566,6 +796,19 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     piecewiseRelativeImprovement: modelAdequacy.piecewiseRelativeImprovement,
     breakpointEvidence: modelAdequacy.breakpointEvidence,
     breakpointSupportBins: modelAdequacy.breakpointSupportBins,
+    smoothCurvatureMagnitudeDb: modelAdequacy.smoothCurvatureMagnitudeDb,
+    smoothCurvatureRmseDb: modelAdequacy.smoothCurvatureRmseDb,
+    smoothResidualRmseDb: modelAdequacy.smoothResidualRmseDb,
+    smoothResidualMadDb: modelAdequacy.smoothResidualMadDb,
+    abruptBreakpointSlopeDelta: modelAdequacy.abruptBreakpointSlopeDelta,
+    abruptBreakpointFrequency: modelAdequacy.abruptBreakpointFrequency,
+    abruptBreakpointRmseDb: modelAdequacy.abruptBreakpointRmseDb,
+    abruptBreakpointImprovementDb: modelAdequacy.abruptBreakpointImprovementDb,
+    abruptBreakpointRelativeImprovement: modelAdequacy.abruptBreakpointRelativeImprovement,
+    abruptBreakpointEvidence: modelAdequacy.abruptBreakpointEvidence,
+    abruptBreakpointSupportBins: modelAdequacy.abruptBreakpointSupportBins,
+    modelAdequacyStatus: quality.modelAdequacyStatus || "not-evaluated",
+    modelAdequacyDetail: quality.modelAdequacyDetail || "Model adequacy was not evaluated because an earlier quality gate fired.",
     classification: quality.label,
     state: quality.state,
     confidence: quality.confidence || "None",
@@ -824,7 +1067,16 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
     input: { rms: overall.rms, dbfs: overall.dbfs, clippingRatio: overall.clippingRatio, nearClipRatio: overall.nearClipRatio, peak: overall.peak, limitingSuspected: overall.limitingSuspected, nonFiniteRatio: overall.nonFiniteRatio },
     flatness: overall.spectralFlatness,
     fit: { beta: overall.beta, rmseDb: overall.rmseDb },
-    tonality: { maxPeakProminenceDb: overall.maxPeakProminenceDb, tonalPowerRatio: overall.tonalPowerRatio },
+    tonality: {
+      slopeNormalizedFlatness: overall.slopeNormalizedFlatness,
+      maxPeakProminenceDb: overall.maxPeakProminenceDb,
+      tonalPowerRatio: overall.tonalPowerRatio,
+      prominentPeakCount: overall.prominentPeakCount,
+      persistentPeakCount: overall.persistentPeakCount,
+      harmonicPeakCount: overall.harmonicPeakCount,
+      harmonicEvidence: overall.harmonicEvidence,
+      broadbandOccupancy: overall.broadbandOccupancy,
+    },
     modelAdequacy: {
       segmentedSlopeDelta: overall.segmentedSlopeDelta,
       logBinnedRmseDb: overall.logBinnedRmseDb,
@@ -832,6 +1084,15 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
       piecewiseImprovementDb: overall.piecewiseImprovementDb,
       piecewiseRelativeImprovement: overall.piecewiseRelativeImprovement,
       breakpointEvidence: overall.breakpointEvidence,
+      smoothCurvatureMagnitudeDb: overall.smoothCurvatureMagnitudeDb,
+      smoothCurvatureRmseDb: overall.smoothCurvatureRmseDb,
+      smoothResidualRmseDb: overall.smoothResidualRmseDb,
+      smoothResidualMadDb: overall.smoothResidualMadDb,
+      abruptBreakpointSlopeDelta: overall.abruptBreakpointSlopeDelta,
+      abruptBreakpointFrequency: overall.abruptBreakpointFrequency,
+      abruptBreakpointImprovementDb: overall.abruptBreakpointImprovementDb,
+      abruptBreakpointRelativeImprovement: overall.abruptBreakpointRelativeImprovement,
+      abruptBreakpointEvidence: overall.abruptBreakpointEvidence,
     },
     temporalSd: reliableSummary.sd || 0,
   });
@@ -852,6 +1113,8 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
     reliable: gated.reliable,
     confidence: gated.confidence || "None",
     qualityDetail: gated.detail,
+    modelAdequacyStatus: gated.modelAdequacyStatus || overall.modelAdequacyStatus,
+    modelAdequacyDetail: gated.modelAdequacyDetail || overall.modelAdequacyDetail,
     temporalBetaMean: reliableSummary.mean,
     temporalBetaSd: reliableSummary.sd,
     temporalBetaMedian: reliableSummary.median,

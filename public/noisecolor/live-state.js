@@ -1,4 +1,4 @@
-import { CANONICAL_COLORS, nearestCanonical } from "./analysis-engine.js?v=0.6.6";
+import { CANONICAL_COLORS, nearestCanonical } from "./analysis-engine.js?v=0.6.8";
 
 const BLOCKING_STATES = new Set(["silence", "tonal", "mixed", "unstable", "clipping", "insufficient", "invalid", "paused", "unavailable", "listening"]);
 
