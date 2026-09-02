@@ -34,6 +34,12 @@ export function sessionSignalPercentages(percentages = {}) {
   return { lowSignal: percentages.silence || 0, awaitingAnalysis: percentages.insufficient || 0 };
 }
 
+export function liveWindowProvenance(sampleCount, capturedSampleCount, sampleRate) {
+  if (!Number.isSafeInteger(sampleCount) || sampleCount < 0 || !Number.isSafeInteger(capturedSampleCount) || capturedSampleCount < sampleCount || !(sampleRate > 0)) throw new Error("Invalid live sample boundary.");
+  const analysisStartSample = capturedSampleCount - sampleCount;
+  return { analysisStartSample, analysisStartSeconds: analysisStartSample / sampleRate, sourceDurationSeconds: capturedSampleCount / sampleRate };
+}
+
 export function capturePcm(samples, { rolling, sessionAccumulator, recordingBuffer, trace, fallback }) {
   trace.record("captureSamples", samples);
   rolling.push(samples);

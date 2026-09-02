@@ -1,7 +1,8 @@
-import { PcmMeter, pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-diagnostic.1";
+import { PcmMeter, pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.1";
+import { sanitizeAudioSettings } from "./privacy.js?v=0.6.8-recovery.1";
 
-export const APP_VERSION = "0.6.8-diagnostic.1";
-export const ENGINE_VERSION = "0.6.8-diagnostic.1";
+export const APP_VERSION = "0.6.8-recovery.1";
+export const ENGINE_VERSION = "0.6.8-recovery.1";
 export const FFT_SIZE = 4096;
 export const WELCH_OVERLAP = 0.5;
 export const DEFAULT_FIT_RANGE = [100, 8000];
@@ -119,7 +120,7 @@ export function welchPSD(samples, sampleRate, requestedSize = FFT_SIZE, overlap 
     frequencies[bin] = (bin * sampleRate) / size;
     power[bin] = Math.max(accumulated[bin] / Math.max(1, segments), Number.MIN_VALUE);
   }
-  return { frequencies, power, segments, availableSegments, fftSize: size };
+  return { frequencies, power, segments, availableSegments, fftSize: size, hopSamples: step, segmentStarts: starts, windowEnergy: energy };
 }
 
 function correctionAt(frequency, profile) {
@@ -749,8 +750,7 @@ function calibrationSnapshot(profile, applied) {
 }
 
 function sanitizeSettings(settings) {
-  if (!settings || typeof settings !== "object") return null;
-  return Object.fromEntries(Object.entries(settings).filter(([key]) => !["deviceId", "groupId"].includes(key)));
+  return sanitizeAudioSettings(settings);
 }
 
 export function analyzeSamples(samples, sampleRate, options = {}) {
@@ -773,6 +773,12 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
   const modelAdequacy = modelAdequacyDiagnostics(psd.frequencies, psd.power, fitRange[0], maxFrequency);
   const durationSeconds = samples.length / sampleRate;
   const quality = qualityGate({ durationSeconds, input, flatness, fit, tonality, modelAdequacy, temporalSd: options.temporalSd || 0 });
+  // Core measurements contain no acquisition history or display transformations.
+  // Persistence and temporal decisions remain explicit contextual evidence.
+  const measurement = { input, rawFit: { ...fit }, rawFlatness: flatness,
+    tonality: { ...tonality, persistentPeakCount: 0 }, modelAdequacy };
+  const coreDecision = qualityGate({ durationSeconds, input, flatness, fit,
+    tonality: measurement.tonality, modelAdequacy, temporalSd: 0 });
   return {
     appVersion: APP_VERSION,
     analysisEngineVersion: ENGINE_VERSION,
@@ -788,6 +794,16 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     welchOverlap: options.overlap ?? WELCH_OVERLAP,
     welchSegments: rawPsd.segments,
     welchAvailableSegments: rawPsd.availableSegments,
+    welchConfiguration: {
+      requestedFftSize: options.fftSize || FFT_SIZE, fftSize: rawPsd.fftSize,
+      overlap: options.overlap ?? WELCH_OVERLAP, hopSamples: rawPsd.hopSamples ?? null,
+      maxSegments: Number.isFinite(options.maxWelchSegments) ? options.maxWelchSegments : null,
+      segments: rawPsd.segments, availableSegments: rawPsd.availableSegments,
+      segmentStarts: rawPsd.segmentStarts || [], window: "symmetric-Hann",
+      windowEnergy: rawPsd.windowEnergy ?? null, detrend: "per-segment-mean",
+      scaling: "one-sided-density-per-Hz", selection: "evenly-distributed-including-endpoints",
+    },
+    requestedFitRange: [...fitRange],
     fitRange: [fitRange[0], maxFrequency],
     analysisMode: options.analysisMode || "balanced",
     analysisWindowSeconds: durationSeconds,
@@ -795,6 +811,16 @@ export function analyzeSamples(samples, sampleRate, options = {}) {
     beta: fit.beta,
     rawMeasuredBeta: fit.beta,
     rawMeasurement: { ...fit, basis: "original-continuous-PSD", weighting: "equal-FFT-ordinates" },
+    measurement,
+    coreDecision,
+    qualityContext: {
+      temporalSd: Number.isFinite(options.temporalSd) ? options.temporalSd : null,
+      temporalObservationCount: options.temporalObservationCount ?? null,
+      temporalSelection: options.temporalSelection || "not-specified",
+      missingTemporalPolicy: "zero used by existing gate; not evidence of observed stability",
+      previousProminentPeakFrequencies: [...(options.previousProminentPeakFrequencies || [])],
+      persistentPeakCount: tonality.persistentPeakCount,
+    },
     correctedEstimate,
     rawSlope: fit.slope,
     intercept: fit.intercept,
@@ -1116,36 +1142,11 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
   const reliableSummary = summarize(observations.filter((item) => item.reliable).map((item) => item.beta));
   let gated = qualityGate({
     durationSeconds: overall.durationSeconds,
-    input: { rms: overall.rms, dbfs: overall.dbfs, clippingRatio: overall.clippingRatio, nearClipRatio: overall.nearClipRatio, peak: overall.peak, limitingSuspected: overall.limitingSuspected, nonFiniteRatio: overall.nonFiniteRatio },
-    flatness: overall.spectralFlatness,
-    fit: { beta: overall.beta, rmseDb: overall.rmseDb },
-    tonality: {
-      slopeNormalizedFlatness: overall.slopeNormalizedFlatness,
-      maxPeakProminenceDb: overall.maxPeakProminenceDb,
-      tonalPowerRatio: overall.tonalPowerRatio,
-      prominentPeakCount: overall.prominentPeakCount,
-      persistentPeakCount: overall.persistentPeakCount,
-      harmonicPeakCount: overall.harmonicPeakCount,
-      harmonicEvidence: overall.harmonicEvidence,
-      broadbandOccupancy: overall.broadbandOccupancy,
-    },
-    modelAdequacy: {
-      segmentedSlopeDelta: overall.segmentedSlopeDelta,
-      logBinnedRmseDb: overall.logBinnedRmseDb,
-      maxBreakpointSlopeDelta: overall.maxBreakpointSlopeDelta,
-      piecewiseImprovementDb: overall.piecewiseImprovementDb,
-      piecewiseRelativeImprovement: overall.piecewiseRelativeImprovement,
-      breakpointEvidence: overall.breakpointEvidence,
-      smoothCurvatureMagnitudeDb: overall.smoothCurvatureMagnitudeDb,
-      smoothCurvatureRmseDb: overall.smoothCurvatureRmseDb,
-      smoothResidualRmseDb: overall.smoothResidualRmseDb,
-      smoothResidualMadDb: overall.smoothResidualMadDb,
-      abruptBreakpointSlopeDelta: overall.abruptBreakpointSlopeDelta,
-      abruptBreakpointFrequency: overall.abruptBreakpointFrequency,
-      abruptBreakpointImprovementDb: overall.abruptBreakpointImprovementDb,
-      abruptBreakpointRelativeImprovement: overall.abruptBreakpointRelativeImprovement,
-      abruptBreakpointEvidence: overall.abruptBreakpointEvidence,
-    },
+    input: overall.measurement.input,
+    flatness: overall.measurement.rawFlatness,
+    fit: overall.measurement.rawFit,
+    tonality: { ...overall.measurement.tonality, persistentPeakCount: overall.persistentPeakCount },
+    modelAdequacy: overall.measurement.modelAdequacy,
     temporalSd: reliableSummary.sd || 0,
   });
   const activityTimeline = buildActivityTimeline(samples, sampleRate, observations, options.activityFrameSeconds || 0.5);
@@ -1171,6 +1172,11 @@ export function analyzeRecording(samples, sampleRate, options = {}) {
     temporalBetaSd: reliableSummary.sd,
     temporalBetaMedian: reliableSummary.median,
     temporalBeta: observations,
+    qualityContext: { ...overall.qualityContext, temporalSd: reliableSummary.sd,
+      temporalObservationCount: observations.filter((item) => item.reliable).length,
+      temporalSelection: "reliable temporal windows only", temporalWindowSeconds: windowSeconds,
+      temporalStepSeconds: stepSeconds, temporalMaxWelchSegments: Math.min(options.maxWelchSegments || 24, 24),
+      observationTimeBasis: "relative-to-measurement-window", activityFrameSeconds: options.activityFrameSeconds || 0.5 },
     colorTimeline: activityTimeline,
     sessionSummary,
   };

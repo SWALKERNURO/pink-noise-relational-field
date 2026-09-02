@@ -7,14 +7,18 @@ import {
   WELCH_OVERLAP,
   SessionAccumulator,
   summarize,
-} from "./analysis-engine.js?v=0.6.8-diagnostic.1";
-import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.8-diagnostic.1";
-import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.8-diagnostic.1";
-import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.8-diagnostic.1";
-import { capturePcm, LiveAnalysisScheduler, MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow, sessionSignalPercentages } from "./live-runtime.js?v=0.6.8-diagnostic.1";
-import { PcmTrace, PcmMeter } from "./pcm-diagnostics.js?v=0.6.8-diagnostic.1";
-import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.8-diagnostic.1";
-import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.8-diagnostic.1";
+} from "./analysis-engine.js?v=0.6.8-recovery.1";
+import { ColorStateMachine, createStatusState } from "./live-state.js?v=0.6.8-recovery.1";
+import { HISTORY_PAGE_SIZE, clearMeasurements, deleteMeasurement, listMeasurementPage, sanitizeMicrophoneSettings, saveMeasurement } from "./history.js?v=0.6.8-recovery.1";
+import { isStandalone, platformInstallHint, setupPwa } from "./pwa.js?v=0.6.8-recovery.1";
+import { capturePcm, liveWindowProvenance, LiveAnalysisScheduler, MODE_CONFIG, ROLLING_SECONDS, RollingBuffer, selectBoundedAnalysisWindow, sessionSignalPercentages } from "./live-runtime.js?v=0.6.8-recovery.1";
+import { PcmTrace, PcmMeter } from "./pcm-diagnostics.js?v=0.6.8-recovery.1";
+import { mixToMono, decodePcmWavTail } from "./pcm-input.js?v=0.6.8-recovery.1";
+import { PRIMARY_ANALYSIS_CONFIG } from "./analysis-pipeline.js?v=0.6.8-recovery.1";
+import { browserDiagnosticInfo, canExportDiagnostic, createDiagnosticBundle } from "./diagnostic-bundle.js?v=0.6.8-recovery.1";
+import { sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.1";
+import { MAX_COMPRESSED_FILE_BYTES, preflightCompressedUpload } from "./upload-safety.js?v=0.6.8-recovery.1";
+import { MicrophoneStartupError, MicrophoneStartupLock, isMicrophoneStartupCancellation, isMicrophoneStartupConflict } from "./microphone-startup.js?v=0.6.8-recovery.1";
 
 const MAX_FILE_BYTES = 40 * 1024 * 1024;
 const MAX_RECORDING_BYTES = 32 * 1024 * 1024;
@@ -31,6 +35,7 @@ const elements = Object.fromEntries([
   "diagnosticGrid", "measuredCopy", "interpretationCopy", "calibrationFile", "calibrationProfile", "calibrationState",
   "scalarGain", "railMeasured", "railInterpretation", "railStatus", "versionLabel", "installSheet", "closeInstallSheet",
   "installInstructions", "privacyChip", "summaryTimeline", "betaDataSummary", "spectrumDataSummary", "spectrogramDataSummary",
+  "exportLiveDiagnosticButton", "exportDiagnosticButton", "diagnosticExportStatus",
 ].map((id) => [id, document.getElementById(id)]));
 
 const stateMachine = new ColorStateMachine();
@@ -70,6 +75,8 @@ const state = {
   liveDisplay: null,
   betaHistory: [],
   latestResult: null,
+  liveDiagnosticResult: null,
+  interruptionEvents: [],
   latestSpectrogram: null,
   lastSummary: null,
   recorder: null,
@@ -113,27 +120,33 @@ function currentOptions(sourceType = "live", sourceFilename = null, extra = {}) 
     ? state.activeCalibration
     : null;
   return {
-    fftSize: FFT_SIZE,
-    overlap: WELCH_OVERLAP,
-    fitRange: DEFAULT_FIT_RANGE,
+    ...PRIMARY_ANALYSIS_CONFIG,
     analysisMode: elements.analysisMode.value,
     sourceType,
     sourceFilename,
     calibrationProfile: profile,
     temporalSd: sourceType === "live" ? summarize(state.observations.slice(-10).filter((item) => item.reliable).map((item) => item.beta)).sd || 0 : 0,
+    temporalObservationCount: sourceType === "live" ? state.observations.slice(-10).filter((item) => item.reliable).length : 0,
+    temporalSelection: sourceType === "live" ? "reliable observations among preceding 10 stable windows" : "computed from recording temporal windows",
     previousProminentPeakFrequencies: sourceType === "live" ? state.latestResult?.prominentPeakFrequencies || [] : [],
-    maxWelchSegments: 48,
     scalarGainDb: Number(elements.scalarGain.value) || 0,
     calibrationRouteKey: state.inputRoute,
     inputRouteLabel: state.inputRouteLabel,
     microphoneSettings: sourceType === "live" || sourceType === "recorded-microphone" ? sanitizeMicrophoneSettings(state.constraintSettings) : null,
+    captureEvents: sourceType === "live" || sourceType === "recorded-microphone" ? structuredClone(state.interruptionEvents) : [],
+    acquisition: {
+      decoder: "Web-Audio-capture", channelCount: 1, channelMix: "browser-explicit-mono",
+      browser: browserDiagnosticInfo(navigator, { secureContext: window.isSecureContext, standalone: isStandalone() }),
+      audioContext: state.audioContext ? { sampleRate: state.audioContext.sampleRate, baseLatency: state.audioContext.baseLatency, outputLatency: state.audioContext.outputLatency, state: state.audioContext.state } : null,
+      track: state.stream?.getAudioTracks()[0] ? { readyState: state.stream.getAudioTracks()[0].readyState, muted: state.stream.getAudioTracks()[0].muted, enabled: state.stream.getAudioTracks()[0].enabled } : null,
+    },
     ...extra,
   };
 }
 
 function ensureWorker() {
   if (state.worker) return state.worker;
-  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.8-diagnostic.1", import.meta.url), { type: "module" });
+  state.worker = new Worker(new URL("./analysis-worker.js?v=0.6.8-recovery.1", import.meta.url), { type: "module" });
   state.worker.addEventListener("message", (event) => {
     const request = state.workerRequests.get(event.data.id);
     if (!request) return;
@@ -154,6 +167,9 @@ function requestAnalysis(type, samples, sampleRate, options = {}) {
   if (state.workerBusy) return Promise.reject(new Error("Analysis is busy; the superseded request was dropped."));
   const worker = ensureWorker();
   const id = ++state.workerId;
+  if (type === "analyze-live" || type === "analyze-fast") {
+    options = { ...options, ...liveWindowProvenance(samples.length, state.sessionAccumulator?.inputMeter.sampleCount || samples.length, sampleRate) };
+  }
   if (type === "analyze-live" || type === "analyze-fast" || options.sourceType === "recorded-microphone") {
     state.pcmTrace?.record(options.sourceType === "recorded-microphone" ? "recordingBuffer" : "rollingBuffer", samples);
     options = { ...options, pcmDiagnostics: { ...captureDiagnostics(), ...options.pcmDiagnostics } };
@@ -255,6 +271,11 @@ function clearAnalysisResults({ resetStatuses = true } = {}) {
   state.latestResult = null;
   state.latestSpectrogram = null;
   state.lastSummary = null;
+  state.liveDiagnosticResult = null;
+  state.interruptionEvents = [];
+  elements.exportLiveDiagnosticButton.disabled = true;
+  elements.exportDiagnosticButton.disabled = true;
+  elements.diagnosticExportStatus.textContent = "No exact measurement available.";
   state.observations = [];
   state.betaHistory = [];
   state.sessionAccumulator = null;
@@ -423,7 +444,7 @@ async function startMicrophone({ recording = false } = {}) {
       const sessionAccumulator = new SessionAccumulator(audioContext.sampleRate);
       const captureSamples = (samples) => {
         if (!state.listening) return;
-        capturePcm(samples, { rolling, sessionAccumulator, recordingBuffer: state.recordingPcm, trace: state.pcmTrace, fallback: state.liveDisplay });
+        capturePcm(samples, { rolling, sessionAccumulator, recordingBuffer: state.recordingPcm, trace: state.pcmTrace, fallback: state.latestResult });
       };
       state.pcmTrace = new PcmTrace();
       state.captureInputPcm = null;
@@ -437,7 +458,7 @@ async function startMicrophone({ recording = false } = {}) {
 
       let captureNode;
       if (audioContext.audioWorklet) {
-        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.8-diagnostic.1");
+        await audioContext.audioWorklet.addModule("./audio-worklet.js?v=0.6.8-recovery.1");
         startup.checkpoint();
         captureNode = new AudioWorkletNode(audioContext, "noisecolor-capture", { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 1, channelCountMode: "explicit", channelInterpretation: "speakers" });
         state.captureTransport = "AudioWorklet / explicit mono input";
@@ -488,6 +509,10 @@ async function startMicrophone({ recording = false } = {}) {
         state.observations = [];
         state.betaHistory = [];
         state.latestResult = null;
+        state.liveDiagnosticResult = null;
+        state.lastSummary = null;
+        state.interruptionEvents = [];
+        elements.exportLiveDiagnosticButton.disabled = true;
         state.latestSpectrogram = null;
         state.captureGeneration += 1;
         stateMachine.reset();
@@ -590,17 +615,20 @@ async function runStableAnalysis() {
     const samples = state.rolling.latest(Math.round(state.sampleRate * config.stableSeconds));
     const result = await requestAnalysis("analyze-live", samples, state.sampleRate, currentOptions("live"));
     if (!state.listening || generation !== state.captureGeneration) return;
-    const timeSeconds = (performance.now() - state.startedAt) / 1000;
-    const stableSeconds = config.stableSeconds;
+    const timeSeconds = result.measurementWindow.endSample / result.sampleRate;
+    const stableSeconds = result.measurementWindow.sampleCount / result.sampleRate;
     const observation = { timeSeconds: Math.max(0, timeSeconds - stableSeconds / 2), startSeconds: Math.max(0, timeSeconds - stableSeconds), endSeconds: timeSeconds, beta: result.beta, state: result.state, classification: result.classification, reliable: result.reliable, rmseDb: result.rmseDb, r2: result.r2, spectralFlatness: result.spectralFlatness };
     state.observations.push(observation);
     if (state.observations.length > 3600) state.observations.splice(0, state.observations.length - 3600);
     state.betaHistory.push(observation);
     state.betaHistory = state.betaHistory.filter((item) => timeSeconds - item.timeSeconds <= 30);
     state.latestResult = result;
+    state.liveDiagnosticResult = result;
+    elements.exportLiveDiagnosticButton.disabled = false;
     const display = stateMachine.update(result);
     displayLiveState(display, result);
-    state.sessionAccumulator?.addObservation({ ...observation, state: display.state, classification: display.label, reliable: display.reliable });
+    // Session science uses the measured decision, never the hysteretic UI label.
+    state.sessionAccumulator?.addObservation(observation);
     const stableValues = state.observations.slice(-10).filter((item) => item.reliable).map((item) => item.beta);
     const stableSummary = summarize(stableValues);
     elements.stability.textContent = Number.isFinite(stableSummary.sd) ? `±${stableSummary.sd.toFixed(2)}` : "—";
@@ -641,9 +669,9 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
   state.listening = false;
   state.captureGeneration += 1;
   stopSchedulers();
-  const durationSeconds = state.startedAt ? (performance.now() - state.startedAt) / 1000 : 0;
+  const durationSeconds = (state.sessionAccumulator?.inputMeter.sampleCount || 0) / state.sampleRate;
   if (!preserveSummary && state.sessionAccumulator?.durationSeconds > 0) {
-    state.sessionAccumulator.finish(state.liveDisplay);
+    state.sessionAccumulator.finish(state.latestResult);
     const session = state.sessionAccumulator.summary(state.observations);
     const sessionReliable = Boolean(session.dominantReliableColor) && session.rejectedPercentage < 20;
     state.lastSummary = {
@@ -716,6 +744,8 @@ async function stopMicrophone({ reason = "Analysis paused", stateName = "paused"
 
 async function interruptActiveCapture(reason, stateName = "paused") {
   if (state.finalizingRecording || state.stopping) return;
+  state.interruptionEvents.push({ kind: reason, sampleOffset: state.sessionAccumulator?.inputMeter.sampleCount ?? 0,
+    elapsedSeconds: state.startedAt ? (performance.now() - state.startedAt) / 1000 : 0, recovered: false });
   if (state.recording) await stopRecording({ interrupted: true, reason });
   else await stopMicrophone({ reason, stateName });
 }
@@ -874,15 +904,6 @@ async function stopRecording({ interrupted = false, reason = "" } = {}) {
   }
 }
 
-function mixToMono(audioBuffer) {
-  const length = audioBuffer.length;
-  const mono = new Float32Array(length);
-  for (let channel = 0; channel < audioBuffer.numberOfChannels; channel += 1) {
-    const data = audioBuffer.getChannelData(channel);
-    for (let index = 0; index < length; index += 1) mono[index] += data[index] / audioBuffer.numberOfChannels;
-  }
-  return mono;
-}
 
 async function loadAudioFile(file) {
   if (!file) return;
@@ -922,9 +943,16 @@ async function loadAudioFile(file) {
       const decoded = await audioContext.decodeAudioData(encoded);
       if (decoded.duration > preflight.durationSeconds + 1 || decoded.numberOfChannels > preflight.channels || decoded.sampleRate > preflight.sampleRate) throw new Error("Decoded audio exceeded its verified preflight layout and was discarded.");
       bounded = selectBoundedAnalysisWindow(mixToMono(decoded), decoded.sampleRate);
+      bounded.acquisition = { decoder: "browser-decodeAudioData", channelCount: decoded.numberOfChannels,
+        channelMix: "arithmetic-mean", declaredSampleRate: preflight.sampleRate, decodedSampleRate: decoded.sampleRate,
+        resampled: preflight.sampleRate !== decoded.sampleRate };
       sampleRate = decoded.sampleRate;
     }
-    const result = await requestAnalysis("analyze-recording", bounded.samples, sampleRate, currentOptions("uploaded-file", file.name, bounded));
+    const { samples: uploadSamples, ...windowMetadata } = bounded;
+    const uploadOptions = currentOptions("uploaded-file", file.name, windowMetadata);
+    uploadOptions.acquisition = { ...windowMetadata.acquisition,
+      browser: browserDiagnosticInfo(navigator, { secureContext: window.isSecureContext, standalone: isStandalone() }) };
+    const result = await requestAnalysis("analyze-recording", uploadSamples, sampleRate, uploadOptions);
     if (analysisGeneration !== state.analysisGeneration) return;
     state.latestResult = result;
     renderResult(elements.uploadResult, result);
@@ -964,66 +992,6 @@ function readCompressedDuration(file, timeoutMs = 5000) {
   });
 }
 
-function decodePcmWavTail(arrayBuffer, maxSeconds = 120) {
-  if (arrayBuffer.byteLength < 44) return null;
-  const view = new DataView(arrayBuffer);
-  const textAt = (offset, length) => String.fromCharCode(...new Uint8Array(arrayBuffer, offset, length));
-  if (textAt(0, 4) !== "RIFF" || textAt(8, 4) !== "WAVE") return null;
-  let format = null;
-  let dataOffset = null;
-  let dataSize = 0;
-  for (let offset = 12; offset + 8 <= arrayBuffer.byteLength;) {
-    const id = textAt(offset, 4);
-    const size = view.getUint32(offset + 4, true);
-    const payload = offset + 8;
-    if (payload + size > arrayBuffer.byteLength) break;
-    if (id === "fmt " && size >= 16) {
-      format = {
-        code: view.getUint16(payload, true),
-        channels: view.getUint16(payload + 2, true),
-        sampleRate: view.getUint32(payload + 4, true),
-        blockAlign: view.getUint16(payload + 12, true),
-        bitsPerSample: view.getUint16(payload + 14, true),
-      };
-    } else if (id === "data") {
-      dataOffset = payload;
-      dataSize = size;
-      break;
-    }
-    offset = payload + size + (size % 2);
-  }
-  if (!format || dataOffset == null || ![1, 3].includes(format.code) || format.channels < 1 || format.channels > 8 || !format.blockAlign || format.sampleRate < 4000 || format.sampleRate > 384000) return null;
-  if ((format.code === 1 && ![8, 16, 24, 32].includes(format.bitsPerSample)) || (format.code === 3 && format.bitsPerSample !== 32)) return null;
-  const totalFrames = Math.floor(dataSize / format.blockAlign);
-  const keptFrames = Math.min(totalFrames, Math.floor(format.sampleRate * maxSeconds));
-  const startFrame = totalFrames - keptFrames;
-  const bytesPerSample = format.bitsPerSample / 8;
-  const samples = new Float32Array(keptFrames);
-  const readSample = (offset) => {
-    if (format.code === 3) return view.getFloat32(offset, true);
-    if (format.bitsPerSample === 8) return (view.getUint8(offset) - 128) / 128;
-    if (format.bitsPerSample === 16) return view.getInt16(offset, true) / 32768;
-    if (format.bitsPerSample === 24) {
-      let value = view.getUint8(offset) | (view.getUint8(offset + 1) << 8) | (view.getUint8(offset + 2) << 16);
-      if (value & 0x800000) value |= 0xff000000;
-      return value / 8388608;
-    }
-    return view.getInt32(offset, true) / 2147483648;
-  };
-  for (let frame = 0; frame < keptFrames; frame += 1) {
-    let mono = 0;
-    const frameOffset = dataOffset + (startFrame + frame) * format.blockAlign;
-    for (let channel = 0; channel < format.channels; channel += 1) mono += readSample(frameOffset + channel * bytesPerSample) / format.channels;
-    samples[frame] = mono;
-  }
-  return {
-    samples,
-    sampleRate: format.sampleRate,
-    sourceDurationSeconds: totalFrames / format.sampleRate,
-    analysisStartSeconds: startFrame / format.sampleRate,
-    analysisTruncated: startFrame > 0,
-  };
-}
 
 function resultMarkup(result) {
   const quality = result.reliable ? `${result.confidence} confidence` : result.qualityDetail;
@@ -1044,7 +1012,7 @@ function resultMarkup(result) {
       <div><span>Calibration</span><strong>${escapeHtml(result.calibrationProfile || "Uncorrected")}</strong></div>
       <div><span>Engine</span><strong>v${escapeHtml(result.analysisEngineVersion)}</strong></div>
     </div>
-    <div class="result-actions"><button type="button" data-action="save">Save to History</button><button type="button" data-action="json">Export JSON</button><button type="button" data-action="csv">Export CSV</button><button type="button" data-action="advanced">View scientific details</button></div>`;
+    <div class="result-actions"><button type="button" data-action="save">Save to History</button><button type="button" data-action="json">Export JSON</button><button type="button" data-action="diagnostic">Export diagnostic bundle</button><button type="button" data-action="csv">Export CSV</button><button type="button" data-action="advanced">View scientific details</button></div>`;
 }
 
 function renderResult(container, result) {
@@ -1057,8 +1025,9 @@ function renderResult(container, result) {
     button.disabled = true;
   });
   container.querySelector('[data-action="json"]').addEventListener("click", () => exportJson(result));
+  container.querySelector('[data-action="diagnostic"]').addEventListener("click", () => exportDiagnostic(result));
   container.querySelector('[data-action="csv"]').addEventListener("click", () => exportCsv(result));
-  container.querySelector('[data-action="advanced"]').addEventListener("click", () => setView("advanced"));
+  container.querySelector('[data-action="advanced"]').addEventListener("click", () => { state.latestResult = result; setView("advanced"); });
 }
 
 function download(filename, content, type) {
@@ -1071,10 +1040,21 @@ function download(filename, content, type) {
 }
 
 function exportJson(result) {
-  download(`noisecolor-${Date.now()}.json`, JSON.stringify(result, null, 2), "application/json");
+  download(`noisecolor-${Date.now()}.json`, JSON.stringify(sanitizeMetadata(result), null, 2), "application/json");
+}
+
+function exportDiagnostic(result) {
+  const isLive = result?.acquisition?.path === "live";
+  const bundle = createDiagnosticBundle(result, {
+    observations: isLive ? state.observations : result?.temporalBeta,
+    session: isLive ? state.sessionAccumulator?.summary(state.observations) || state.lastSummary : result?.sessionSummary,
+    interruptionEvents: isLive ? state.interruptionEvents : result?.captureEvents || [],
+  });
+  download(`noisecolor-diagnostic-${bundle.acquisition.path}-${Date.now()}.json`, JSON.stringify(bundle, null, 2), "application/json");
 }
 
 function exportCsv(result) {
+  result = sanitizeMetadata(result);
   const metadata = [
     ["NoiseColor version", result.appVersion], ["analysis engine", result.analysisEngineVersion], ["timestamp", result.timestamp],
     ["source type", result.sourceType], ["source filename", result.sourceFilename], ["sample rate", result.sampleRate],
@@ -1286,6 +1266,10 @@ function drawSpectrogram(spectrogram) {
 }
 
 function renderAdvanced(result) {
+  elements.exportDiagnosticButton.disabled = !canExportDiagnostic(result);
+  elements.diagnosticExportStatus.textContent = canExportDiagnostic(result)
+    ? "Exports this exact measurement's PSD and diagnostics locally. No raw audio, filenames or device identifiers."
+    : "Exact PSD unavailable. Analyze again; compact history cannot recreate a diagnostic bundle.";
   drawSpectrum(result);
   drawSpectrogram(result?.spectrogram || state.latestSpectrogram);
   if (!result) {
@@ -1293,6 +1277,9 @@ function renderAdvanced(result) {
     return;
   }
   const diagnostics = [
+    ["Acquisition", result.acquisition?.path || result.sourceType],
+    ["Captured window", result.measurementWindow ? `${result.measurementWindow.startSample}–${result.measurementWindow.endSample} samples · ${result.measurementWindow.job}` : "Not retained"],
+    ["Temporal evidence", `${result.qualityContext?.temporalObservationCount ?? "unknown"} observations · ${result.qualityContext?.temporalSelection || "not retained"}`],
     ["Calibration-derived β (not raw)", formatNumber(result.correctedEstimate?.beta)],
     ["Adjusted support", formatNumber(result.abruptBreakpointSupportOctaves, 2, " oct")],
     ["Adjusted basis novelty", formatNumber(result.abruptBreakpointMinimumNovelty, 4)],
@@ -1417,7 +1404,11 @@ elements.clearButton.addEventListener("click", resetApplication);
 elements.stopLiveButton.addEventListener("click", () => stopMicrophone());
 elements.analysisMode.addEventListener("change", () => {
   elements.windowValue.textContent = `${modeConfig().stableSeconds} sec`;
-  if (state.listening && !state.recording) startSchedulers();
+  if (state.listening && !state.recording) {
+    state.captureGeneration += 1; // ignore in-flight results from the prior mode
+    stateMachine.reset();
+    startSchedulers();
+  }
 });
 elements.recordButton.addEventListener("click", startRecording);
 elements.stopRecordButton.addEventListener("click", stopRecording);
@@ -1435,6 +1426,8 @@ elements.historyNext.addEventListener("click", () => { state.historyOffset += HI
 elements.saveSummaryButton.addEventListener("click", async () => { if (state.lastSummary) { await saveMeasurement(state.lastSummary); elements.saveSummaryButton.textContent = "Saved locally"; elements.saveSummaryButton.disabled = true; } });
 elements.exportSummaryButton.addEventListener("click", () => state.lastSummary && exportJson(state.lastSummary));
 elements.exportSummaryCsvButton.addEventListener("click", () => state.lastSummary && exportCsv(state.lastSummary));
+elements.exportLiveDiagnosticButton.addEventListener("click", () => state.liveDiagnosticResult && exportDiagnostic(state.liveDiagnosticResult));
+elements.exportDiagnosticButton.addEventListener("click", () => canExportDiagnostic(state.latestResult) && exportDiagnostic(state.latestResult));
 elements.calibrationFile.addEventListener("change", (event) => importCalibration(event.target.files?.[0]));
 elements.calibrationProfile.addEventListener("change", selectCalibration);
 elements.installButton.addEventListener("click", async () => {

@@ -1,3 +1,5 @@
+import { sanitizeAudioSettings, sanitizeMetadata } from "./privacy.js?v=0.6.8-recovery.1";
+
 const DATABASE_NAME = "noisecolor-local-history";
 const DATABASE_VERSION = 2;
 const STORE_NAME = "measurements";
@@ -38,8 +40,7 @@ function sampleEvenly(values, maximum = MAX_TEMPORAL_POINTS) {
 }
 
 export function sanitizeMicrophoneSettings(settings) {
-  if (!settings || typeof settings !== "object") return null;
-  return Object.fromEntries(Object.entries(settings).filter(([key]) => !["deviceId", "groupId"].includes(key)));
+  return sanitizeAudioSettings(settings);
 }
 
 export function compactMeasurement(result) {
@@ -51,7 +52,7 @@ export function compactMeasurement(result) {
     ...metadata
   } = result || {};
   return {
-    ...metadata,
+    ...sanitizeMetadata(metadata),
     temporalBeta: sampleEvenly(metadata.temporalBeta),
     colorTimeline: sampleEvenly(metadata.colorTimeline),
     microphoneSettings: sanitizeMicrophoneSettings(metadata.microphoneSettings),

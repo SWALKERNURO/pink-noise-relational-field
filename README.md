@@ -89,6 +89,8 @@ Vite serves the relational field at `/` and NoiseColor at `/noisecolor/index.htm
 
 ## Tests and production build
 
+NoiseColor recovery architecture and reproducible local diagnostic export are documented in [the architecture review](docs/noisecolor-recovery-architecture.md) and [diagnostic guide](docs/noisecolor-recovery-diagnostics.md). Diagnostic bundles preserve the original PSD/configuration without raw audio or device identifiers; they do not claim a cause for the unresolved physical-device beta discrepancy.
+
 Run the complete verification suite:
 
 ```bash

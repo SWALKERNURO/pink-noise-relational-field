@@ -65,6 +65,7 @@ test("NoiseColor exposes local audio upload and decoded-file provenance", async 
   assert.match(html, /id="audioFile"[^>]+accept="audio\/\*/);
   assert.match(app, /async function loadAudioFile\(file\)/);
   assert.match(app, /decodeAudioData/);
-  assert.match(app, /currentOptions\("uploaded-file", file\.name, bounded\)/);
+  assert.match(app, /currentOptions\("uploaded-file", file\.name, windowMetadata\)/);
+  assert.match(app, /samples: uploadSamples, \.\.\.windowMetadata/);
   assert.match(app, /addEventListener\("drop"/);
 });

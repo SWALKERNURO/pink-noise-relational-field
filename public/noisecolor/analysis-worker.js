@@ -1,19 +1,18 @@
-import { analyzeRecording, analyzeSamples, buildSpectrogram } from "./analysis-engine.js?v=0.6.8-diagnostic.1";
-import { pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-diagnostic.1";
+import { buildSpectrogram } from "./analysis-engine.js?v=0.6.8-recovery.1";
+import { analyzePcm } from "./analysis-pipeline.js?v=0.6.8-recovery.1";
+import { normalizePcm } from "./pcm-input.js?v=0.6.8-recovery.1";
 
 self.addEventListener("message", (event) => {
   const { id, type, samples: rawSamples, sampleRate, options } = event.data;
   try {
-    const samples = rawSamples instanceof Float32Array ? rawSamples : new Float32Array(rawSamples);
+    const samples = normalizePcm(rawSamples);
     if (type === "analyze-live" || type === "analyze-fast") {
-      const result = analyzeSamples(samples, sampleRate, options);
-      result.pcmDiagnostics = { ...options?.pcmDiagnostics, workerInput: pcmMetrics(samples), analyzerInput: result.pcm };
+      const result = analyzePcm({ samples, sampleRate, path: "live", options: { ...options, requestId: id, job: type === "analyze-fast" ? "fast-preview" : "primary" } });
       self.postMessage({ id, type, result });
       return;
     }
     if (type === "analyze-recording") {
-      const result = analyzeRecording(samples, sampleRate, options);
-      result.pcmDiagnostics = { ...options?.pcmDiagnostics, ...result.pcmDiagnostics, workerInput: pcmMetrics(samples), analyzerInput: result.pcm };
+      const result = analyzePcm({ samples, sampleRate, path: options?.sourceType === "uploaded-file" ? "upload" : "recording", options: { ...options, requestId: id } });
       result.spectrogram = buildSpectrogram(samples, sampleRate, { maxFrames: 80 });
       self.postMessage({ id, type, result });
       return;

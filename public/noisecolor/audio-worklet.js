@@ -1,4 +1,4 @@
-import { PcmMeter, pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-diagnostic.1";
+import { PcmMeter, pcmMetrics } from "./pcm-diagnostics.js?v=0.6.8-recovery.1";
 
 class NoiseColorCaptureProcessor extends AudioWorkletProcessor {
   constructor() {
