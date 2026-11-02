@@ -139,3 +139,7 @@ The selected design reference and comparison evidence are documented in [`docs/d
 ## License
 
 Released under the [MIT License](LICENSE).
+
+## Related interdisciplinary research
+
+For the broader research questions motivating this portfolio, see [Spencer H. Walker's research profile](https://github.com/SWALKERNURO/living-field/blob/main/RESEARCH-PROFILE.md), including a **proposed** philosophy-of-mind and human–AI interaction study of conversational memory, expressive speech, contextual inference, and epistemic trust. That separate proposal has no completed experimental findings and does not alter the scope of the EEG or audio analyses here.
