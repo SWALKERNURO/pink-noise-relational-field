@@ -1,5 +1,7 @@
 # Pink Noise Relational Field
 
+[![DOI](https://zenodo.org/badge/1347616694.svg)](https://zenodo.org/badge/latestdoi/1347616694)
+
 An interactive scientific visualization of posterior EEG 1/f structure, eye-movement candidates, and blink candidates from a 31:31 video recording. The interface keeps measured results, interpretation, and open questions visibly separate.
 
 ![Pink Noise Relational Field interface](docs/design/implementation-measured-final.png)
